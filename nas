@@ -28,6 +28,7 @@ exec python3 "$0" "$@"
 """
 
 
+import fcntl
 import grp
 import json
 import os
@@ -45,7 +46,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "8.6"
+VERSION = "9.4"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -58,6 +59,11 @@ HDD_SLEEP_FILE = STATE_DIR / "hdd-sleep.json"
 HDD_SLEEP_UNIT = Path("/etc/systemd/system/nas-hdd-sleep.service")
 HDD_STATUS_FILE = STATE_DIR / "hdd-status.json"
 HDD_ALERT_FILE = STATE_DIR / "hdd-sleep-alerts.json"
+SPACE_MONITOR_FILE = STATE_DIR / "space-monitor.json"
+SPACE_ALERT_FILE = STATE_DIR / "space-alerts.json"
+SPACE_REALERT_SECONDS = 6 * 3600
+MONITOR_LOCK_FILE = STATE_DIR / "monitor.lock"
+SPACE_LOCK_FILE = STATE_DIR / "space-check.lock"
 HDD_MONITOR_UNIT = Path("/etc/systemd/system/nas-hdd-monitor.service")
 PUSH_FILE = STATE_DIR / "push.json"
 PUSH_DEFAULT_URL = "https://push-server.o1-1.xct258.top/api/push"
@@ -2523,7 +2529,7 @@ def disk_list() -> list[dict]:
     if not shutil.which("lsblk"):
         return []
     proc = run(["lsblk", "-J", "-b", "-d",
-                "-o", "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,ROTA,TRAN"],
+                "-o", "NAME,KNAME,PATH,TYPE,SIZE,MODEL,ROTA,TRAN"],
                check=False)
     if proc.returncode != 0:
         return []
@@ -2553,7 +2559,6 @@ def disk_list() -> list[dict]:
             "path": str(item.get("path") or f"/dev/{name}"),
             "size": size_i,
             "model": str(item.get("model") or "").strip(),
-            "serial": str(item.get("serial") or "").strip(),
             "rota": rotational,
             "tran": str(item.get("tran") or "").strip(),
         })
@@ -2627,13 +2632,13 @@ def smart_info(path: str) -> dict:
     info = {
         "available": shutil.which("smartctl") is not None,
         "health": "未知", "temp": "", "hours": "",
-        "model": "", "serial": "", "error": "", "raw": "",
+        "error": "", "raw": "",
     }
     if not info["available"]:
         info["error"] = "smartctl 未安装"
         return info
     try:
-        proc = run(["smartctl", "-H", "-A", "-i", path], check=False, timeout=20)
+        proc = run(["smartctl", "-H", "-A", path], check=False, timeout=20)
     except NasError as exc:
         info["health"] = "不可用"
         info["error"] = str(exc)
@@ -2647,11 +2652,6 @@ def smart_info(path: str) -> dict:
                 "smart health status" in lower:
             if ":" in stripped:
                 info["health"] = stripped.split(":", 1)[1].strip()
-        if not info["model"] and stripped.startswith(
-                ("Device Model:", "Model Number:", "Product:", "Model Family:")):
-            info["model"] = stripped.split(":", 1)[1].strip()
-        if not info["serial"] and stripped.startswith("Serial Number:"):
-            info["serial"] = stripped.split(":", 1)[1].strip()
         if "Temperature_Celsius" in stripped or "Airflow_Temperature_Cel" in stripped:
             number = _smart_number(stripped)
             if number:
@@ -2701,7 +2701,6 @@ def disk_detail_lines(disk: dict) -> list[str]:
         f"容量 {_size_text(disk['size'])} · {kind}"
         + (f" · {disk['tran']}" if disk["tran"] else ""),
         f"型号 {disk['model'] or '未知'}",
-        f"序列号 {disk['serial'] or '未知'}",
     ]
     if pool:
         lines.append(f"ZFS 池 {pool}")
@@ -2743,7 +2742,7 @@ def load_hdd_sleep() -> dict[str, dict]:
     result = {}
     for key, value in data.items():
         if isinstance(value, dict):
-            result[str(key)] = value
+            result[str(value.get("name") or key)] = value
     return result
 
 
@@ -2756,7 +2755,7 @@ def save_hdd_sleep(data: dict[str, dict]) -> None:
 
 
 def hdd_sleep_key(disk: dict) -> str:
-    return disk.get("serial") or disk.get("name") or disk.get("path")
+    return disk.get("name") or disk.get("path")
 
 
 def hdd_sleep_value(minutes: int) -> str:
@@ -2800,7 +2799,10 @@ def load_hdd_status() -> dict[str, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    return {
+        str(v.get("name") or k): v
+        for k, v in data.items() if isinstance(v, dict)
+    }
 
 
 def save_hdd_status(data: dict[str, dict]) -> None:
@@ -2818,7 +2820,10 @@ def load_hdd_alerts() -> dict[str, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    return {
+        str(v.get("name") or k): v
+        for k, v in data.items() if isinstance(v, dict)
+    }
 
 
 def save_hdd_alerts(data: dict[str, dict]) -> None:
@@ -2877,7 +2882,7 @@ def save_push_config(config: dict) -> None:
 
 
 def push_message(title: str, message: str, status: str = "info",
-                 *, config: dict | None = None) -> bool:
+                 *, config: dict | None = None, mode: str = "append") -> bool:
     config = config or load_push_config()
     payload = {
         "server_name": config["server_name"],
@@ -2888,7 +2893,7 @@ def push_message(title: str, message: str, status: str = "info",
         "status": status,
         "push_to_mqtt": bool(config["push_to_mqtt"]),
         "msg_type": "markdown",
-        "mode": "append",
+        "mode": mode if mode in {"append", "overwrite"} else "append",
     }
     request = urllib.request.Request(
         config["url"],
@@ -2927,8 +2932,8 @@ def notify_hdd_event(disk: dict, event: str, minutes: int, note: str = "") -> No
             status = "warn" if note else "info"
         lines = [
             f"- 设备：`{disk['path']}`",
-            f"- 型号：{disk.get('model') or '未知'}"
-            f" · 序列号 {disk.get('serial') or '未知'}",
+            f"- 型号：{disk.get('model') or '未知'}",
+            f"- ZFS 池：{disk.get('pool') or '未使用'}",
             f"- 当前状态：{state}",
             f"- 空闲休眠：{minutes} 分钟" if minutes > 0 else "- 空闲休眠：未设置",
             f"- 时间：{stamp}",
@@ -2949,7 +2954,7 @@ def disable_hdd_sleep(disk: dict, reason: str, minutes: int, wakes: int) -> None
     alerts = load_hdd_alerts()
     alerts[key] = {
         "name": disk["name"], "path": disk["path"], "model": disk["model"],
-        "serial": disk["serial"], "time": time.time(), "reason": reason,
+        "time": time.time(), "reason": reason,
         "minutes": minutes, "wakes": wakes,
     }
     save_hdd_alerts(alerts)
@@ -2962,20 +2967,29 @@ def hdd_monitor() -> int:
         interval = max(10, int(os.environ.get("NAS_HDD_MONITOR_INTERVAL", "60")))
     except ValueError:
         interval = 60
-    if not load_hdd_sleep():
-        print("nas-hdd-monitor: 没有配置休眠，退出", flush=True)
+    if not load_hdd_sleep() and not space_monitor_needed():
+        print("nas-hdd-monitor: 没有配置休眠或空间监控，退出", flush=True)
+        return 0
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    monitor_lock = open(MONITOR_LOCK_FILE, "w")
+    try:
+        fcntl.flock(monitor_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("nas-hdd-monitor: 已有监控进程，退出", flush=True)
+        monitor_lock.close()
         return 0
     previous = load_hdd_status()
     print(f"nas-hdd-monitor: 启动，间隔 {interval}s", flush=True)
     while True:
-        if not load_hdd_sleep():
-            print("nas-hdd-monitor: 没有配置休眠，退出", flush=True)
+        if not load_hdd_sleep() and not space_monitor_needed():
+            print("nas-hdd-monitor: 没有配置休眠或空间监控，退出", flush=True)
             return 0
         current: dict[str, dict] = {}
         now = time.time()
         settings = load_hdd_sleep()
         try:
             disks = disk_list()
+            pool_map = disk_pool_map()
         except NasError as exc:
             print(f"读取磁盘列表失败: {exc}", flush=True)
             time.sleep(interval)
@@ -2984,6 +2998,7 @@ def hdd_monitor() -> int:
             if not disk.get("rota"):
                 continue
             key = hdd_sleep_key(disk)
+            pool = pool_map.get(disk["path"], "")
             try:
                 code = hdd_power_code(disk["path"])
             except NasError as exc:
@@ -3039,14 +3054,16 @@ def hdd_monitor() -> int:
                     settings.pop(key, None)
                     wake_note = f"{reason}，已取消休眠并保持常转"
             if event and minutes > 0:
-                notify_hdd_event(disk, event, minutes, wake_note)
+                event_disk = dict(disk)
+                event_disk["pool"] = pool
+                notify_hdd_event(event_disk, event, minutes, wake_note)
 
             changed = old.get("since") if old_power == code else now
             current[key] = {
                 "name": disk["name"],
                 "path": disk["path"],
                 "model": disk["model"],
-                "serial": disk["serial"],
+                "pool": pool,
                 "power": code,
                 "state": {
                     "standby": "已休眠", "sleeping": "休眠中",
@@ -3059,6 +3076,7 @@ def hdd_monitor() -> int:
             }
         save_hdd_status(current)
         previous = current
+        check_space_alerts()
         time.sleep(interval)
 
 
@@ -3071,14 +3089,13 @@ def apply_hdd_sleep_settings() -> None:
     if not settings and not alerts:
         return
     disks = disk_list()
-    by_serial = {disk["serial"]: disk for disk in disks if disk["serial"]}
     by_name = {disk["name"]: disk for disk in disks}
-    for key in alerts:
-        disk = by_serial.get(key) or by_name.get(key)
+    for key, value in alerts.items():
+        disk = by_name.get(key) or by_name.get(str(value.get("name") or ""))
         if disk is not None:
             run(["hdparm", "-S", "0", disk["path"]], check=False, timeout=20)
     for key, value in settings.items():
-        disk = by_serial.get(key) or by_name.get(key)
+        disk = by_name.get(key) or by_name.get(str(value.get("name") or ""))
         if disk is None:
             continue
         try:
@@ -3092,6 +3109,173 @@ def apply_hdd_sleep_settings() -> None:
         if proc.returncode != 0:
             print(f"设置 {disk['path']} 休眠失败: "
                   f"{(proc.stderr or proc.stdout).strip()[:200]}")
+
+
+def load_space_config() -> dict:
+    config = {"enabled": False, "thresholds": {}}
+    try:
+        data = json.loads(SPACE_MONITOR_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return config
+    if not isinstance(data, dict):
+        return config
+    config["enabled"] = bool(data.get("enabled"))
+    thresholds = data.get("thresholds")
+    if isinstance(thresholds, dict):
+        for name, value in thresholds.items():
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= number <= 99:
+                config["thresholds"][str(name)] = number
+    return config
+
+
+def save_space_config(config: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SPACE_MONITOR_FILE.with_name(SPACE_MONITOR_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, SPACE_MONITOR_FILE)
+
+
+def space_usage_text(row: dict) -> str:
+    return (f"{_size_text(row['free'])} / {_size_text(row['size'])}"
+            f"（{row['percent']:.1f}%）")
+
+
+def space_threshold(config: dict, pool: str) -> int:
+    try:
+        return int(config.get("thresholds", {}).get(pool, 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def load_space_alerts() -> dict[str, dict]:
+    try:
+        data = json.loads(SPACE_ALERT_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def save_space_alerts(data: dict[str, dict]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SPACE_ALERT_FILE.with_name(SPACE_ALERT_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, SPACE_ALERT_FILE)
+
+
+def pool_space_rows() -> list[dict]:
+    if not zfs_available():
+        return []
+    proc = run(["zpool", "list", "-Hp", "-o", "name,size,free,health"], check=False)
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        name, size, free, health = parts[:4]
+        if not size.isdigit() or not free.isdigit():
+            continue
+        mounted = run(["zfs", "get", "-H", "-o", "value", "mounted", name],
+                      check=False).stdout.strip()
+        if mounted != "yes":
+            continue
+        size_i, free_i = int(size), int(free)
+        percent = (free_i / size_i * 100) if size_i else 0.0
+        rows.append({
+            "name": name, "size": size_i, "free": free_i,
+            "percent": percent, "health": health, "mounted": mounted,
+        })
+    return rows
+
+
+def check_space_alerts() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(SPACE_LOCK_FILE, "w")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        _check_space_alerts_locked()
+    finally:
+        handle.close()
+
+
+def _check_space_alerts_locked() -> None:
+    config = load_space_config()
+    if not config["enabled"]:
+        if load_space_alerts():
+            save_space_alerts({})
+        return
+    rows = pool_space_rows()
+    alerts = load_space_alerts()
+    push_config = load_push_config()
+    now = time.time()
+    changed = False
+    current_pools = {row["name"] for row in rows}
+
+    for row in rows:
+        pool = row["name"]
+        threshold = space_threshold(config, pool)
+        if threshold <= 0:
+            if pool in alerts:
+                alerts.pop(pool, None)
+                changed = True
+            continue
+        low = row["percent"] < threshold
+        old = alerts.get(pool)
+        if low:
+            if not old or not old.get("low") or now - float(old.get("time", 0)) >= SPACE_REALERT_SECONDS:
+                detail = (
+                    f"- 池：{pool}\n"
+                    f"- 剩余：{_size_text(row['free'])} / {_size_text(row['size'])}"
+                    f"（{row['percent']:.1f}%）\n"
+                    f"- 阈值：低于 {threshold}%\n"
+                    f"- 健康：{row['health']}\n"
+                    f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                title = f"ZFS 池 {pool} 空间不足"
+                if push_config["enabled"]:
+                    push_message(title, detail, "warn", config=push_config,
+                                 mode="overwrite")
+                else:
+                    print(f"{title}（推送未开启）: {row['percent']:.1f}% < {threshold}%",
+                          flush=True)
+                alerts[pool] = {
+                    "low": True, "time": now, "free": row["free"],
+                    "size": row["size"], "percent": row["percent"],
+                    "threshold": threshold, "health": row["health"],
+                }
+                changed = True
+        elif old and old.get("low"):
+            if push_config["enabled"]:
+                push_message(
+                    f"ZFS 池 {pool} 空间已恢复",
+                    f"- 池：{pool}\n- 剩余：{space_usage_text(row)}\n"
+                    f"- 阈值：{threshold}%\n"
+                    f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    "ok", config=push_config, mode="overwrite",
+                )
+            alerts.pop(pool, None)
+            changed = True
+
+    for pool in list(alerts):
+        if pool not in current_pools:
+            alerts.pop(pool, None)
+            changed = True
+    if changed:
+        save_space_alerts(alerts)
+
+
+def space_monitor_needed() -> bool:
+    return bool(load_space_config().get("enabled"))
 
 
 # ---------------------------------------------------------------- tui
@@ -4526,16 +4710,13 @@ def ui_zfs_menu() -> None:
 
 
 def _disk_label(disk: dict, pool_map: dict[str, str]) -> str:
-    pool = pool_map.get(disk["path"], "")
+    pool = pool_map.get(disk["path"], "") or "未使用"
     kind = "HDD" if disk["rota"] else "SSD"
     model = (disk["model"] or "未知")[:26]
-    label = (
-        f"{disk['name']:<8} {_size_text(disk['size']):>7}  {kind:<3} "
-        f"{disk['tran'] or '-':<5} {model}"
+    return (
+        f"{disk['name']:<7} [{pool}] {_size_text(disk['size']):>7}  "
+        f"{kind:<3} {disk['tran'] or '-':<5} {model}"
     )
-    if pool:
-        label += f"  [{pool}]"
-    return label
 
 
 def ui_disk_detail(disk: dict) -> None:
@@ -4711,6 +4892,75 @@ def ui_disk_import_pool() -> None:
         apply_iscsi_locks()
 
 
+def ui_space_monitor_menu() -> None:
+    if not zfs_available():
+        print("未安装 ZFS。")
+        return
+    while True:
+        config = load_space_config()
+        rows = pool_space_rows()
+        alerts = load_space_alerts()
+        push = load_push_config()
+        info = [
+            f"监控 {'开启' if config['enabled'] else '关闭'}",
+            f"推送 {'开启' if push['enabled'] else '关闭'}",
+            f"当前告警 {len(alerts)} 个池",
+        ]
+        if not config["enabled"]:
+            info.append("开启后按各池阈值检查剩余空间")
+        options: list[tuple[str, object]] = [
+            ("关闭空间监控" if config["enabled"] else "开启空间监控", "toggle"),
+        ]
+        for row in rows:
+            threshold = space_threshold(config, row["name"])
+            state = "不足" if threshold and row["percent"] < threshold else "正常"
+            if threshold <= 0:
+                state = "已关闭"
+            options.append((
+                f"{row['name']}  剩余 {space_usage_text(row)}  "
+                f"阈值 {threshold}%  {state}",
+                row["name"],
+            ))
+        options += [
+            ("推送提醒设置", "push"),
+            ("刷新", "refresh"),
+            ("返回", "back"),
+        ]
+        choice = select_one("硬盘空间监控", options, info=info)
+        if choice in (None, "back"):
+            return
+        if choice == "refresh":
+            continue
+        if choice == "toggle":
+            config["enabled"] = not config["enabled"]
+            save_space_config(config)
+            sync_hdd_monitor_service()
+            if config["enabled"]:
+                check_space_alerts()
+                print("已开启空间监控。")
+            else:
+                save_space_alerts({})
+                print("已关闭空间监控。")
+            pause()
+            continue
+        if choice == "push":
+            ui_hdd_push_settings()
+            continue
+        pool = str(choice)
+        current = space_threshold(config, pool)
+        raw = ask_text(f"{pool} 剩余空间阈值（%，0 关闭）", str(current))
+        if not raw.isdigit() or not 0 <= int(raw) <= 99:
+            print("阈值必须是 0-99 的整数。")
+            pause()
+            continue
+        config["thresholds"][pool] = int(raw)
+        save_space_config(config)
+        sync_hdd_monitor_service()
+        check_space_alerts()
+        print(f"已设置 {pool} 阈值为 {int(raw)}%" + ("（关闭提醒）" if int(raw) == 0 else ""))
+        pause()
+
+
 def ui_disk_menu() -> None:
     while True:
         rows = disk_list()
@@ -4719,6 +4969,7 @@ def ui_disk_menu() -> None:
         choice = select_one("硬盘管理", [
             ("磁盘列表 / SMART", "list"),
             ("机械硬盘休眠", "sleep"),
+            ("空间监控", "space"),
             ("创建 ZFS 池", "create"),
             ("导入 ZFS 池", "import"),
             ("返回", "back"),
@@ -4731,6 +4982,9 @@ def ui_disk_menu() -> None:
             ui_disk_list()
         elif choice == "sleep":
             ui_hdd_sleep_menu()
+            pause()
+        elif choice == "space":
+            ui_space_monitor_menu()
             pause()
         elif choice == "create":
             ui_disk_create_pool()
@@ -4757,12 +5011,11 @@ def _hdd_sleep_label(disk: dict, settings: dict[str, dict],
                 "%m-%d %H:%M", time.localtime(float(changed)))
         except (TypeError, ValueError, OSError):
             pass
-    pool = pool_map.get(disk["path"], "")
-    suffix = f" [{pool}]" if pool else ""
+    pool = pool_map.get(disk["path"], "") or "未使用"
     alert_text = "  [异常唤醒-已取消]" if key in alerts else ""
     return (
-        f"{disk['name']:<7} {_size_text(disk['size']):>7}  "
-        f"休眠 {timeout:<7} 当前 {state}{change_text}{alert_text}{suffix}"
+        f"{disk['name']:<7} [{pool}] {_size_text(disk['size']):>7}  "
+        f"休眠 {timeout:<7} 当前 {state}{change_text}{alert_text}"
     )
 
 
@@ -4805,7 +5058,7 @@ def ui_hdd_sleep_detail(disk: dict) -> None:
             changed_text = "未知"
         info = [
             f"设备 {disk['path']}",
-            f"型号 {disk['model'] or '未知'} · 序列号 {disk['serial'] or '未知'}",
+            f"型号 {disk['model'] or '未知'}",
             f"当前状态 {cached.get('state') or hdd_power_state(disk['path'])}",
             f"空闲休眠 {'关闭' if not minutes else str(minutes) + ' 分钟'}",
             f"上次状态变化 {changed_text}",
@@ -4855,7 +5108,6 @@ def ui_hdd_sleep_detail(disk: dict) -> None:
                 settings[key] = {
                     "minutes": choice,
                     "name": disk["name"],
-                    "serial": disk["serial"],
                     "model": disk["model"],
                     "armed_at": time.time(),
                 }
@@ -5034,7 +5286,7 @@ WantedBy=multi-user.target
 """
 
 HDD_MONITOR_UNIT_TEXT = """[Unit]
-Description=NAS HDD sleep state monitor
+Description=NAS HDD sleep and ZFS space monitor
 After=zfs-import.target zfs-mount.service nas-hdd-sleep.service
 ConditionPathExists=/usr/local/bin/nas
 
@@ -5120,7 +5372,7 @@ def install_hdd_sleep_unit() -> None:
 def sync_hdd_monitor_service() -> None:
     if not HDD_MONITOR_UNIT.exists():
         return
-    if load_hdd_sleep():
+    if load_hdd_sleep() or space_monitor_needed():
         run(["systemctl", "enable", "nas-hdd-monitor.service"], check=False)
         run(["systemctl", "restart", "nas-hdd-monitor.service"], check=False)
     else:
@@ -5214,6 +5466,12 @@ def system_status_lines() -> list[str]:
 
     target_names, store_names = iscsi_suspended_summary() if shutil.which("targetcli") else ([], [])
     lines.append(f"隐藏 target  {len(target_names)} 个")
+    if space_monitor_needed() or load_space_alerts():
+        space_alerts = load_space_alerts()
+        lines.append(
+            f"空间监控  {'开启' if space_monitor_needed() else '关闭'}"
+            f" · 告警 {len(space_alerts)} 个池"
+        )
     return lines
 
 
@@ -5446,6 +5704,14 @@ def main_info_lines() -> list[str]:
             disks = disk_list()
             lines.append(f"硬盘   {len(disks)} 块")
             hdds = [disk for disk in disks if disk["rota"]]
+            space_cfg = load_space_config()
+            space_alerts = load_space_alerts()
+            if space_cfg.get("enabled") or space_alerts:
+                if space_alerts:
+                    names = "、".join(space_alerts.keys())
+                    lines.append(f"空间告警  {len(space_alerts)} 个池（{names}）")
+                else:
+                    lines.append("空间监控  开启")
             if hdds:
                 alerts = load_hdd_alerts()
                 if not shutil.which("hdparm"):
