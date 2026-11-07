@@ -46,7 +46,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "9.4"
+VERSION = "9.5"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -3111,8 +3111,12 @@ def apply_hdd_sleep_settings() -> None:
                   f"{(proc.stderr or proc.stdout).strip()[:200]}")
 
 
+SYSTEM_SPACE_KEY = "/"
+SYSTEM_SPACE_LABEL = "系统盘"
+
+
 def load_space_config() -> dict:
-    config = {"enabled": False, "thresholds": {}}
+    config = {"enabled": False, "thresholds": {}, "system_threshold": 10}
     try:
         data = json.loads(SPACE_MONITOR_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -3129,6 +3133,12 @@ def load_space_config() -> dict:
                 continue
             if 0 <= number <= 99:
                 config["thresholds"][str(name)] = number
+    try:
+        system_number = int(data.get("system_threshold", 10))
+    except (TypeError, ValueError):
+        system_number = 10
+    if 0 <= system_number <= 99:
+        config["system_threshold"] = system_number
     return config
 
 
@@ -3145,11 +3155,20 @@ def space_usage_text(row: dict) -> str:
             f"（{row['percent']:.1f}%）")
 
 
-def space_threshold(config: dict, pool: str) -> int:
+def space_threshold(config: dict, target: str) -> int:
+    if target == SYSTEM_SPACE_KEY:
+        raw = config.get("system_threshold", 10)
+    else:
+        raw = config.get("thresholds", {}).get(target, 10)
     try:
-        return int(config.get("thresholds", {}).get(pool, 10))
+        value = int(raw)
     except (TypeError, ValueError):
         return 10
+    return value if 0 <= value <= 99 else 10
+
+
+def space_alert_label(key: str) -> str:
+    return SYSTEM_SPACE_LABEL if key == SYSTEM_SPACE_KEY else key
 
 
 def load_space_alerts() -> dict[str, dict]:
@@ -3195,6 +3214,37 @@ def pool_space_rows() -> list[dict]:
     return rows
 
 
+def system_space_row() -> dict | None:
+    try:
+        stats = os.statvfs(SYSTEM_SPACE_KEY)
+    except OSError:
+        return None
+    size = stats.f_blocks * stats.f_frsize
+    free = stats.f_bavail * stats.f_frsize
+    if size <= 0:
+        return None
+    fstype = run(["stat", "-f", "-c", "%T", SYSTEM_SPACE_KEY],
+                 check=False).stdout.strip() or "-"
+    return {
+        "name": SYSTEM_SPACE_KEY, "label": SYSTEM_SPACE_LABEL,
+        "mount": SYSTEM_SPACE_KEY, "size": size, "free": free,
+        "percent": free / size * 100, "fstype": fstype, "kind": "system",
+    }
+
+
+def space_targets() -> list[dict]:
+    targets: list[dict] = []
+    system = system_space_row()
+    if system:
+        targets.append(system)
+    for row in pool_space_rows():
+        item = dict(row)
+        item["label"] = f"ZFS 池 {row['name']}"
+        item["kind"] = "pool"
+        targets.append(item)
+    return targets
+
+
 def check_space_alerts() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     handle = open(SPACE_LOCK_FILE, "w")
@@ -3208,67 +3258,91 @@ def check_space_alerts() -> None:
         handle.close()
 
 
+def _space_alert_detail(target: dict, threshold: int, stamp: str) -> str:
+    if target["kind"] == "system":
+        return (
+            f"- 分区：{target['mount']}\n"
+            f"- 文件系统：{target.get('fstype') or '-'}\n"
+            f"- 剩余：{space_usage_text(target)}\n"
+            f"- 阈值：低于 {threshold}%\n"
+            f"- 时间：{stamp}"
+        )
+    return (
+        f"- 池：{target['name']}\n"
+        f"- 剩余：{space_usage_text(target)}\n"
+        f"- 阈值：低于 {threshold}%\n"
+        f"- 健康：{target.get('health') or '-'}\n"
+        f"- 时间：{stamp}"
+    )
+
+
 def _check_space_alerts_locked() -> None:
     config = load_space_config()
     if not config["enabled"]:
         if load_space_alerts():
             save_space_alerts({})
         return
-    rows = pool_space_rows()
+    targets = space_targets()
     alerts = load_space_alerts()
     push_config = load_push_config()
     now = time.time()
     changed = False
-    current_pools = {row["name"] for row in rows}
+    current_keys = {target["name"] for target in targets}
 
-    for row in rows:
-        pool = row["name"]
-        threshold = space_threshold(config, pool)
+    for target in targets:
+        key = target["name"]
+        label = target["label"]
+        threshold = space_threshold(config, key)
         if threshold <= 0:
-            if pool in alerts:
-                alerts.pop(pool, None)
+            if key in alerts:
+                alerts.pop(key, None)
                 changed = True
             continue
-        low = row["percent"] < threshold
-        old = alerts.get(pool)
+        low = target["percent"] < threshold
+        old = alerts.get(key)
         if low:
-            if not old or not old.get("low") or now - float(old.get("time", 0)) >= SPACE_REALERT_SECONDS:
-                detail = (
-                    f"- 池：{pool}\n"
-                    f"- 剩余：{_size_text(row['free'])} / {_size_text(row['size'])}"
-                    f"（{row['percent']:.1f}%）\n"
-                    f"- 阈值：低于 {threshold}%\n"
-                    f"- 健康：{row['health']}\n"
-                    f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                title = f"ZFS 池 {pool} 空间不足"
+            if (not old or not old.get("low")
+                    or now - float(old.get("time", 0)) >= SPACE_REALERT_SECONDS):
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                title = f"{label} 空间不足"
+                detail = _space_alert_detail(target, threshold, stamp)
                 if push_config["enabled"]:
                     push_message(title, detail, "warn", config=push_config,
                                  mode="overwrite")
                 else:
-                    print(f"{title}（推送未开启）: {row['percent']:.1f}% < {threshold}%",
+                    print(f"{title}（推送未开启）: {target['percent']:.1f}% < {threshold}%",
                           flush=True)
-                alerts[pool] = {
-                    "low": True, "time": now, "free": row["free"],
-                    "size": row["size"], "percent": row["percent"],
-                    "threshold": threshold, "health": row["health"],
+                alerts[key] = {
+                    "low": True, "time": now, "free": target["free"],
+                    "size": target["size"], "percent": target["percent"],
+                    "threshold": threshold, "label": label,
+                    "kind": target["kind"],
                 }
+                if target["kind"] == "system":
+                    alerts[key]["mount"] = target["mount"]
+                else:
+                    alerts[key]["health"] = target.get("health")
                 changed = True
         elif old and old.get("low"):
             if push_config["enabled"]:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                if target["kind"] == "system":
+                    head = (f"- 分区：{target['mount']}\n"
+                            f"- 文件系统：{target.get('fstype') or '-'}")
+                else:
+                    head = f"- 池：{key}"
                 push_message(
-                    f"ZFS 池 {pool} 空间已恢复",
-                    f"- 池：{pool}\n- 剩余：{space_usage_text(row)}\n"
-                    f"- 阈值：{threshold}%\n"
-                    f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"{label} 空间已恢复",
+                    f"{head}\n- 剩余：{space_usage_text(target)}\n"
+                    f"- 阈值：{threshold}%\n- 时间：{stamp}",
                     "ok", config=push_config, mode="overwrite",
                 )
-            alerts.pop(pool, None)
+            alerts.pop(key, None)
             changed = True
 
-    for pool in list(alerts):
-        if pool not in current_pools:
-            alerts.pop(pool, None)
+    for key in list(alerts):
+        if key not in current_keys:
+            alerts.pop(key, None)
             changed = True
     if changed:
         save_space_alerts(alerts)
@@ -4898,28 +4972,30 @@ def ui_space_monitor_menu() -> None:
         return
     while True:
         config = load_space_config()
-        rows = pool_space_rows()
+        targets = space_targets()
         alerts = load_space_alerts()
         push = load_push_config()
         info = [
             f"监控 {'开启' if config['enabled'] else '关闭'}",
             f"推送 {'开启' if push['enabled'] else '关闭'}",
-            f"当前告警 {len(alerts)} 个池",
+            f"当前告警 {len(alerts)} 处",
         ]
         if not config["enabled"]:
-            info.append("开启后按各池阈值检查剩余空间")
+            info.append("开启后按系统盘和各池阈值检查剩余空间")
         options: list[tuple[str, object]] = [
             ("关闭空间监控" if config["enabled"] else "开启空间监控", "toggle"),
         ]
-        for row in rows:
-            threshold = space_threshold(config, row["name"])
-            state = "不足" if threshold and row["percent"] < threshold else "正常"
+        for target in targets:
+            key = target["name"]
+            label = "系统盘 /" if target["kind"] == "system" else key
+            threshold = space_threshold(config, key)
+            state = "不足" if threshold and target["percent"] < threshold else "正常"
             if threshold <= 0:
                 state = "已关闭"
             options.append((
-                f"{row['name']}  剩余 {space_usage_text(row)}  "
+                f"{label}  剩余 {space_usage_text(target)}  "
                 f"阈值 {threshold}%  {state}",
-                row["name"],
+                key,
             ))
         options += [
             ("推送提醒设置", "push"),
@@ -4946,18 +5022,23 @@ def ui_space_monitor_menu() -> None:
         if choice == "push":
             ui_hdd_push_settings()
             continue
-        pool = str(choice)
-        current = space_threshold(config, pool)
-        raw = ask_text(f"{pool} 剩余空间阈值（%，0 关闭）", str(current))
+        key = str(choice)
+        label = "系统盘 /" if key == SYSTEM_SPACE_KEY else key
+        current = space_threshold(config, key)
+        raw = ask_text(f"{label} 剩余空间阈值（%，0 关闭）", str(current))
         if not raw.isdigit() or not 0 <= int(raw) <= 99:
             print("阈值必须是 0-99 的整数。")
             pause()
             continue
-        config["thresholds"][pool] = int(raw)
+        if key == SYSTEM_SPACE_KEY:
+            config["system_threshold"] = int(raw)
+        else:
+            config["thresholds"][key] = int(raw)
         save_space_config(config)
         sync_hdd_monitor_service()
         check_space_alerts()
-        print(f"已设置 {pool} 阈值为 {int(raw)}%" + ("（关闭提醒）" if int(raw) == 0 else ""))
+        print(f"已设置 {label} 阈值为 {int(raw)}%"
+              + ("（关闭提醒）" if int(raw) == 0 else ""))
         pause()
 
 
@@ -5470,7 +5551,7 @@ def system_status_lines() -> list[str]:
         space_alerts = load_space_alerts()
         lines.append(
             f"空间监控  {'开启' if space_monitor_needed() else '关闭'}"
-            f" · 告警 {len(space_alerts)} 个池"
+            f" · 告警 {len(space_alerts)} 处"
         )
     return lines
 
@@ -5708,8 +5789,8 @@ def main_info_lines() -> list[str]:
             space_alerts = load_space_alerts()
             if space_cfg.get("enabled") or space_alerts:
                 if space_alerts:
-                    names = "、".join(space_alerts.keys())
-                    lines.append(f"空间告警  {len(space_alerts)} 个池（{names}）")
+                    names = "、".join(space_alert_label(key) for key in space_alerts)
+                    lines.append(f"空间告警  {len(space_alerts)} 处（{names}）")
                 else:
                     lines.append("空间监控  开启")
             if hdds:
