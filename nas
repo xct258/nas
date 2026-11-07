@@ -41,9 +41,11 @@ import sys
 import termios
 import time
 import tty
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-VERSION = "8.5"
+VERSION = "8.6"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -57,6 +59,10 @@ HDD_SLEEP_UNIT = Path("/etc/systemd/system/nas-hdd-sleep.service")
 HDD_STATUS_FILE = STATE_DIR / "hdd-status.json"
 HDD_ALERT_FILE = STATE_DIR / "hdd-sleep-alerts.json"
 HDD_MONITOR_UNIT = Path("/etc/systemd/system/nas-hdd-monitor.service")
+PUSH_FILE = STATE_DIR / "push.json"
+PUSH_DEFAULT_URL = "https://push-server.o1-1.xct258.top/api/push"
+PUSH_DEFAULT_TOPIC = "nas/hdd-sleep"
+PUSH_TIMEOUT = 8
 HDD_SLEEP = os.environ.get("NAS_HDD_SLEEP") == "1"
 HDD_MONITOR = os.environ.get("NAS_HDD_MONITOR") == "1"
 ISCSI_DESIRED = STATE_DIR / "iscsi-desired.json"
@@ -2823,6 +2829,118 @@ def save_hdd_alerts(data: dict[str, dict]) -> None:
     os.replace(tmp, HDD_ALERT_FILE)
 
 
+def _default_server_name() -> str:
+    name = os.uname().nodename.strip()
+    return name or "nas"
+
+
+def default_push_config() -> dict:
+    return {
+        "enabled": False,
+        "url": PUSH_DEFAULT_URL,
+        "server_name": _default_server_name(),
+        "topic": PUSH_DEFAULT_TOPIC,
+        "push_to_mqtt": True,
+    }
+
+
+def load_push_config() -> dict:
+    config = default_push_config()
+    try:
+        data = json.loads(PUSH_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return config
+    if not isinstance(data, dict):
+        return config
+    if "enabled" in data:
+        config["enabled"] = bool(data.get("enabled"))
+    url = data.get("url")
+    if isinstance(url, str) and url.strip().startswith(("http://", "https://")):
+        config["url"] = url.strip()
+    name = data.get("server_name")
+    if isinstance(name, str) and name.strip():
+        config["server_name"] = name.strip()
+    topic = data.get("topic")
+    if isinstance(topic, str) and topic.strip():
+        config["topic"] = topic.strip()
+    if "push_to_mqtt" in data:
+        config["push_to_mqtt"] = bool(data.get("push_to_mqtt"))
+    return config
+
+
+def save_push_config(config: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PUSH_FILE.with_name(PUSH_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, PUSH_FILE)
+
+
+def push_message(title: str, message: str, status: str = "info",
+                 *, config: dict | None = None) -> bool:
+    config = config or load_push_config()
+    payload = {
+        "server_name": config["server_name"],
+        "category": "service",
+        "topic": config["topic"],
+        "title": title,
+        "message": message,
+        "status": status,
+        "push_to_mqtt": bool(config["push_to_mqtt"]),
+        "msg_type": "markdown",
+        "mode": "append",
+    }
+    request = urllib.request.Request(
+        config["url"],
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=PUSH_TIMEOUT) as response:
+            response.read(4096)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        detail = str(exc)
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                detail = f"{exc.code} {exc.read(500).decode('utf-8', 'replace')}"
+            except OSError:
+                detail = f"{exc.code} {exc.reason}"
+        print(f"推送失败（{title}）: {detail}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+def notify_hdd_event(disk: dict, event: str, minutes: int, note: str = "") -> None:
+    config = load_push_config()
+    if not config["enabled"]:
+        return
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        if event == "sleep":
+            title = f"硬盘 {disk['name']} 已休眠"
+            state = "已休眠"
+            status = "ok"
+        else:
+            title = f"硬盘 {disk['name']} 被唤醒"
+            state = "活动"
+            status = "warn" if note else "info"
+        lines = [
+            f"- 设备：`{disk['path']}`",
+            f"- 型号：{disk.get('model') or '未知'}"
+            f" · 序列号 {disk.get('serial') or '未知'}",
+            f"- 当前状态：{state}",
+            f"- 空闲休眠：{minutes} 分钟" if minutes > 0 else "- 空闲休眠：未设置",
+            f"- 时间：{stamp}",
+        ]
+        if note:
+            lines.append(f"- 处理：{note}")
+        push_message(title, "\n".join(lines), status, config=config)
+    except Exception as exc:  # 推送失败不能影响监控
+        print(f"推送异常（{disk['name']} {event}）: {exc}",
+              file=sys.stderr, flush=True)
+
+
 def disable_hdd_sleep(disk: dict, reason: str, minutes: int, wakes: int) -> None:
     key = hdd_sleep_key(disk)
     settings = load_hdd_sleep()
@@ -2892,6 +3010,7 @@ def hdd_monitor() -> int:
                 minutes = int(value.get("minutes", 0) or 0)
             except (TypeError, ValueError):
                 minutes = 0
+            wake_note = ""
             if event == "wake" and minutes > 0:
                 try:
                     armed = float(value.get("armed_at", 0) or 0)
@@ -2918,6 +3037,9 @@ def hdd_monitor() -> int:
                 if reason:
                     disable_hdd_sleep(disk, reason, minutes, wakes)
                     settings.pop(key, None)
+                    wake_note = f"{reason}，已取消休眠并保持常转"
+            if event and minutes > 0:
+                notify_hdd_event(disk, event, minutes, wake_note)
 
             changed = old.get("since") if old_power == code else now
             current[key] = {
@@ -4769,6 +4891,89 @@ def ui_hdd_sleep_detail(disk: dict) -> None:
             pause()
 
 
+PUSH_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+PUSH_TOPIC_RE = re.compile(r"^[A-Za-z0-9._/\-]{1,128}$")
+
+
+def ui_hdd_push_settings() -> None:
+    while True:
+        config = load_push_config()
+        info = [
+            f"状态 {'已开启' if config['enabled'] else '已关闭'}"
+            f" · MQTT {'推送' if config['push_to_mqtt'] else '仅记录'}",
+            f"地址 {config['url']}",
+            f"来源 {config['server_name']}",
+            f"主题 {config['topic']}",
+            "事件 每次进入休眠 / 被唤醒（仅限已设置休眠的机械盘）",
+        ]
+        actions = [
+            ("关闭推送提醒" if config["enabled"] else "开启推送提醒", "toggle"),
+            ("设置推送地址", "url"),
+            ("设置来源名称 server_name", "server"),
+            ("设置主题 topic", "topic"),
+            ("切换 MQTT 推送", "mqtt"),
+            ("发送测试推送", "test"),
+            ("返回", "back"),
+        ]
+        action = select_one("推送提醒设置", actions, info=info)
+        if action in (None, "back"):
+            return
+        if action == "toggle":
+            config["enabled"] = not config["enabled"]
+            save_push_config(config)
+            if config["enabled"]:
+                print("已开启推送提醒：硬盘休眠/唤醒时会发送通知。")
+                if not HDD_MONITOR_UNIT.exists():
+                    print("提示: 状态监控服务未安装，"
+                          "请先在「系统集成 / 一键配置」中安装。")
+            else:
+                print("已关闭推送提醒。")
+            pause()
+        elif action == "url":
+            url = ask_text("推送地址", config["url"]).strip()
+            if not url.startswith(("http://", "https://")):
+                print("地址必须以 http:// 或 https:// 开头，未修改。")
+            else:
+                config["url"] = url
+                save_push_config(config)
+                print("已保存推送地址。")
+            pause()
+        elif action == "server":
+            name = ask_text("来源名称 server_name",
+                            config["server_name"]).strip()
+            if not PUSH_NAME_RE.match(name):
+                print("来源名称只能包含字母、数字、点、下划线、短横线（1-64 位）。")
+            else:
+                config["server_name"] = name
+                save_push_config(config)
+                print("已保存来源名称。")
+            pause()
+        elif action == "topic":
+            topic = ask_text("主题 topic", config["topic"]).strip()
+            if not PUSH_TOPIC_RE.match(topic):
+                print("主题只能包含字母、数字、点、下划线、短横线和斜杠（1-128 位）。")
+            else:
+                config["topic"] = topic
+                save_push_config(config)
+                print("已保存主题。")
+            pause()
+        elif action == "mqtt":
+            config["push_to_mqtt"] = not config["push_to_mqtt"]
+            save_push_config(config)
+            print("已切换为 "
+                  + ("推送到 MQTT。" if config["push_to_mqtt"] else "仅保存记录，不推送 MQTT。"))
+            pause()
+        elif action == "test":
+            message = "\n".join([
+                "- 这是一条来自 nas 的测试通知。",
+                f"- 来源：{config['server_name']}",
+                f"- 时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            ])
+            if push_message("NAS 推送测试", message, "info", config=config):
+                print("测试推送已发送。")
+            pause()
+
+
 def ui_hdd_sleep_menu() -> None:
     if not shutil.which("hdparm"):
         print("未安装 hdparm：apt install hdparm")
@@ -4781,23 +4986,28 @@ def ui_hdd_sleep_menu() -> None:
         settings = load_hdd_sleep()
         status = load_hdd_status()
         alerts = load_hdd_alerts()
+        push_config = load_push_config()
         pool_map = disk_pool_map()
         options = [
             (_hdd_sleep_label(disk, settings, pool_map, status, alerts), disk["path"])
             for disk in rows
         ]
-        options += [("刷新", "refresh"), ("返回", "back")]
+        options += [("推送提醒设置", "push"), ("刷新", "refresh"), ("返回", "back")]
         monitor = _unit_state("nas-hdd-monitor.service", "is-active") \
             if HDD_MONITOR_UNIT.exists() else "未安装"
         info = [
             f"休眠服务 {'已安装' if HDD_SLEEP_UNIT.exists() else '未安装（请运行系统集成）'}",
             f"状态监控 {monitor}",
             f"异常保护 {len(alerts)} 块盘",
+            f"推送提醒 {'已开启' if push_config['enabled'] else '已关闭'}",
         ]
         choice = select_one("机械硬盘休眠", options, info=info)
         if choice in (None, "back"):
             return
         if choice == "refresh":
+            continue
+        if choice == "push":
+            ui_hdd_push_settings()
             continue
         disk = next((row for row in rows if row["path"] == choice), None)
         if disk is not None:

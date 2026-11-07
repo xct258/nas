@@ -16,7 +16,7 @@
 | 用户 | 查看、添加、重置密码、启用/禁用、删除（可同时删除 Linux 用户） |
 | iSCSI | 新建/删除 iSCSI 磁盘、ZFS zvol、initiator ACL、CHAP、Portal |
 | ZFS | 存储池状态、scrub、数据集/zvol 创建删除、快照创建/回滚/删除、加密数据集密钥管理 |
-| 硬盘 | 磁盘列表、SMART、机械硬盘休眠/状态监控/异常唤醒保护、创建/导入 ZFS 池 |
+| 硬盘 | 磁盘列表、SMART、机械硬盘休眠/状态监控/异常唤醒保护/推送提醒、创建/导入 ZFS 池 |
 | 加密联动 | 未解锁时访问被拒绝、停止导出 iSCSI LUN；解锁后自动挂载/恢复 |
 | 依赖 | 检查 ZFS / SMB / iSCSI / wsdd2，按缺失项安装 |
 | 系统集成 | 一键安装依赖、启用服务、安装开机保护、设置 canmount=noauto |
@@ -113,7 +113,7 @@ nas
 │  └─ 返回
 ├─ 硬盘管理
 │  ├─ 磁盘列表 / SMART  ← 型号/序列号/温度/健康/通电时间
-│  ├─ 机械硬盘休眠      ← 按盘设置空闲休眠/立即休眠
+│  ├─ 机械硬盘休眠      ← 按盘设置空闲休眠/立即休眠/推送提醒
 │  ├─ 创建 ZFS 池       ← stripe/mirror/raidz1/2/3
 │  ├─ 导入 ZFS 池       ← 可强制导入
 │  └─ 返回
@@ -459,6 +459,7 @@ canmount=noauto
 ```
 /var/lib/nas/hdd-sleep.json                机械硬盘休眠设置
 /var/lib/nas/hdd-status.json               机械硬盘状态/上次变化/历史事件
+/var/lib/nas/push.json                     休眠唤醒推送提醒配置
 /var/lib/nas/iscsi-desired.json            iSCSI 完整期望配置
 /etc/rtslib-fb-target/saveconfig.json      当前实际导出
 /etc/systemd/system/nas-lock-guard.service
@@ -746,6 +747,40 @@ systemctl restart nas-hdd-monitor.service
 - 机械盘在 ZFS 池里能休眠，但效果取决于访问频率和 ZFS 后台活动
 - USB 硬盘盒可能不支持 `hdparm -S`，会显示驱动错误
 - 休眠只影响机械盘，SSD 不会出现在这个列表里
+
+### 休眠推送提醒
+
+「机械硬盘休眠 → 推送提醒设置」可以把休眠/唤醒事件推送到推送服务，配置保存在 `/var/lib/nas/push.json`，默认接口：
+
+```text
+https://push-server.o1-1.xct258.top/api/push
+```
+
+覆盖事件：
+
+- 已设置休眠的机械盘每次**进入休眠**
+- 每次**被唤醒**
+- 如果唤醒同时触发了异常唤醒保护，状态为 `warn`，内容里会带上取消原因
+
+通知参数：`category=service`、`msg_type=markdown`、`mode=append`，状态为 `ok`（休眠）/ `info`（唤醒）/ `warn`（异常唤醒）。关闭总开关后不会发送任何请求。
+
+设置项：
+
+| 项目 | 说明 |
+|---|---|
+| 开启 / 关闭 | 总开关，默认关闭 |
+| 推送地址 | 默认 `https://push-server.o1-1.xct258.top/api/push` |
+| server_name | 来源名称，默认主机名；只允许字母、数字、点、下划线、短横线 |
+| topic | 默认 `nas/hdd-sleep`；允许字母、数字、点、下划线、短横线、斜杠 |
+| MQTT | 开启时 `push_to_mqtt=true`；关闭时只在服务端保存记录 |
+| 发送测试推送 | 立即发一条测试通知，不受总开关影响 |
+
+说明：
+
+- 推送由 `nas-hdd-monitor.service` 执行；监控服务未安装或未运行时不发送
+- 只推送已经设置休眠的机械盘，SSD 和未设置休眠的盘不会产生通知
+- 推送失败只写入 journal，不会影响休眠监控
+- 测试推送会真实调用接口；检查 `journalctl -u nas-hdd-monitor.service -f` 可以看发送失败原因
 
 ## 创建 ZFS 池
 
