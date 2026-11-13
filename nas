@@ -52,7 +52,7 @@ try:
 except ImportError:  # 极少见：无 curses 的 Python 环境退回原来的 ANSI 界面
     curses = None
 
-VERSION = "9.6"
+VERSION = "9.7"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -4078,7 +4078,7 @@ def _ui_move(rows, sel, step) -> int:
     return sel
 
 
-def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
+def _ui_draw_dashboard(scr, rows, sel) -> None:
     scr.erase()
     h, w = scr.getmaxyx()
     if h < 16 or w < 52:
@@ -4109,7 +4109,6 @@ def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
         _ui_add(scr, y, 2, text, curses.A_REVERSE if selected else 0)
         y += 1
 
-    _ui_add(scr, h - 2, 2, msg or "就绪", _ui_color(4))
     _ui_add(scr, h - 1, 2,
             " ↑/↓ 选择   Enter 执行   q 退出   快捷键见方括号 ", curses.A_DIM)
 
@@ -4133,13 +4132,11 @@ def _ui_run_handler(scr, key) -> bool:
 def _ui_dashboard(scr) -> None:
     rows = _ui_rows()
     sel = _ui_first(rows)
-    msg = ""
     while True:
         rows = _ui_rows()
-        _ui_draw_dashboard(scr, rows, sel, msg)
+        _ui_draw_dashboard(scr, rows, sel)
         scr.refresh()
         ch = _ui_key(scr)
-        msg = ""
         if isinstance(ch, int):
             if ch == curses.KEY_UP:
                 sel = _ui_move(rows, sel, -1)
