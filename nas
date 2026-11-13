@@ -42,11 +42,17 @@ import sys
 import termios
 import time
 import tty
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "9.5"
+try:
+    import curses
+except ImportError:  # 极少见：无 curses 的 Python 环境退回原来的 ANSI 界面
+    curses = None
+
+VERSION = "9.6"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -3396,7 +3402,7 @@ def _viewport(index: int, total: int, extra: int = 0) -> tuple[int, int]:
     return start, start + rows
 
 
-def select_one(title: str, options: list[tuple[str, object]], default: int = 0,
+def _select_one_raw(title: str, options: list[tuple[str, object]], default: int = 0,
                info: list[str] | None = None):
     """方向键选择；info 会显示在标题下方。"""
     if not options:
@@ -3450,7 +3456,7 @@ def select_one(title: str, options: list[tuple[str, object]], default: int = 0,
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def select_multi(title: str, options: list[tuple[str, object]], initial=None,
+def _select_multi_raw(title: str, options: list[tuple[str, object]], initial=None,
                  info: list[str] | None = None):
     """空格切换勾选，Enter 确认；返回选中的 value 列表，q/Esc 返回 None。"""
     if not options:
@@ -3507,7 +3513,7 @@ def select_multi(title: str, options: list[tuple[str, object]], initial=None,
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def read_line(prompt: str) -> str:
+def _read_line_raw(prompt: str) -> str:
     """规范模式读取一行，避免 input() 的预读把方向键/后续按键吞掉。"""
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
@@ -3532,7 +3538,7 @@ def read_line(prompt: str) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def read_secret(prompt: str) -> str:
+def _read_secret_raw(prompt: str) -> str:
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     try:
@@ -3581,8 +3587,611 @@ def ask_keep_bool(title: str, current: bool):
     return select_one(title, options)
 
 
-def pause() -> None:
+def _pause_raw() -> None:
     read_line("\n按 Enter 返回…")
+
+
+# ---------------------------------------------------------------- 交互界面
+_UI_SCREEN = None
+_OUT_BUF: list[str] = []
+_INFO_CACHE = {"ts": 0.0, "lines": []}
+
+
+class _BufferedOut:
+    """交互模式下的 stdout：把 print 收进缓冲区，稍后用分页视图展示。"""
+
+    encoding = "utf-8"
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        _OUT_BUF.append(text)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        return sys.__stdout__.fileno()
+
+
+def _ui_w(s) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
+
+
+def _ui_pad(s, width: int) -> str:
+    s = str(s)
+    return s + " " * max(0, width - _ui_w(s))
+
+
+def _ui_add(scr, y, x, text, attr=0) -> None:
+    """按显示宽度截断后再写入，避免中文撑到最后一格导致整屏滚动。"""
+    try:
+        h, w = scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        avail = max(0, w - x - 1)
+        out = []
+        used = 0
+        for ch in str(text):
+            cw = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if used + cw > avail:
+                break
+            out.append(ch)
+            used += cw
+        scr.addstr(y, x, "".join(out), attr)
+    except Exception:
+        pass
+
+
+def _ui_box(scr, y, x, h, w, title="", attr=0) -> None:
+    if h < 2 or w < 4:
+        return
+    _ui_add(scr, y, x, "┌" + "─" * (w - 2) + "┐")
+    for i in range(1, h - 1):
+        _ui_add(scr, y + i, x, "│")
+        _ui_add(scr, y + i, x + w - 1, "│")
+    _ui_add(scr, y + h - 1, x, "└" + "─" * (w - 2) + "┘")
+    if title:
+        _ui_add(scr, y, x + 2, f" {title} ", attr | curses.A_BOLD)
+
+
+def _ui_key(scr):
+    try:
+        return scr.get_wch()
+    except AttributeError:
+        return scr.getch()
+    except curses.error:
+        return None
+
+
+def _ui_setup(scr) -> None:
+    scr.keypad(True)
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass
+    if curses.has_colors():
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+            curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        except Exception:
+            pass
+
+
+def _ui_color(pair: int):
+    if curses.has_colors():
+        try:
+            return curses.color_pair(pair)
+        except Exception:
+            return 0
+    return 0
+
+
+def _flush_output() -> None:
+    """把缓冲区里的输出用分页视图展示出来。"""
+    if not _OUT_BUF or _UI_SCREEN is None:
+        return
+    text = "".join(_OUT_BUF)
+    _OUT_BUF.clear()
+    if not text.strip():
+        return
+    _ui_pager("输出", text)
+
+
+def _ui_pager(title, text) -> None:
+    scr = _UI_SCREEN
+    lines = str(text).rstrip("\n").split("\n") or [""]
+    top = 0
+    while True:
+        h, w = scr.getmaxyx()
+        scr.erase()
+        _ui_box(scr, 0, 0, h, w, title)
+        body = max(1, h - 4)
+        for i, ln in enumerate(lines[top: top + body]):
+            _ui_add(scr, 2 + i, 2, ln)
+        more = "  ↑/↓ 滚动  PgUp/PgDn 翻页  Enter/q 返回 "
+        if top + body < len(lines):
+            more = f" [{top + body}/{len(lines)}] " + more
+        _ui_add(scr, h - 1, 2, more, curses.A_DIM)
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                top = max(0, top - 1)
+            elif ch == curses.KEY_DOWN:
+                top = min(max(0, len(lines) - body), top + 1)
+            elif ch == curses.KEY_PPAGE:
+                top = max(0, top - body)
+            elif ch == curses.KEY_NPAGE:
+                top = min(max(0, len(lines) - body), top + body)
+            elif ch == curses.KEY_HOME:
+                top = 0
+            elif ch == curses.KEY_END:
+                top = max(0, len(lines) - body)
+            elif ch in (10, 13, 27, curses.KEY_ENTER):
+                return
+        elif ch in ("q", "\x1b", "\n", "\r"):
+            return
+
+
+def _ui_msg(title, text, wait="按任意键返回") -> None:
+    scr = _UI_SCREEN
+    lines = str(text).rstrip("\n").split("\n")
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(40, max([_ui_w(x) for x in lines] + [_ui_w(title)]) + 8))
+        bh = min(h - 2, len(lines) + 4)
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        for i, ln in enumerate(lines[: bh - 3]):
+            _ui_add(scr, y0 + 2 + i, x0 + 2, ln)
+        _ui_add(scr, y0 + bh - 1, x0 + 2, f" {wait} ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if ch is not None:
+            return
+
+
+def _ui_choice(title, options, default=0, info=None):
+    """圈选一个选项，返回索引；q/Esc 返回 None。"""
+    scr = _UI_SCREEN
+    if not options:
+        return None
+    info = list(info or [])
+    pos = min(max(default, 0), len(options) - 1)
+
+    def max_rows(h):
+        return max(3, h - 9 - len(info))
+
+    while True:
+        h, w = scr.getmaxyx()
+        rows = max_rows(h)
+        start = max(0, min(pos - rows // 2, len(options) - rows))
+        visible = options[start:start + rows]
+        bw = min(w - 4, max(40, max([_ui_w(o) for o in options] + [_ui_w(title)]) + 10))
+        bh = min(h - 2, len(info) + len(visible) + 5)
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        y = y0 + 1
+        for line in info:
+            if y >= y0 + bh - 3:
+                break
+            _ui_add(scr, y, x0 + 2, "  " + line, curses.A_DIM)
+            y += 1
+        if info:
+            y += 1
+        for i, opt in enumerate(visible):
+            real = start + i
+            attr = curses.A_REVERSE if real == pos else 0
+            _ui_add(scr, y, x0 + 2, " " + _ui_pad(opt, bw - 6) + " ", attr)
+            y += 1
+        if start > 0:
+            _ui_add(scr, y0 + 1, x0 + bw - 3, "…")
+        if start + rows < len(options):
+            _ui_add(scr, y0 + bh - 2, x0 + bw - 3, "…")
+        footer = ("↑/↓ 选择  Enter 确认  q 取消"
+                  if len(options) <= rows else
+                  f"{pos + 1}/{len(options)}  ↑/↓ 选择  Enter 确认  q 取消")
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + footer + " ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                pos = (pos - 1) % len(options)
+            elif ch == curses.KEY_DOWN:
+                pos = (pos + 1) % len(options)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(options) - 1
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return pos
+            elif ch in (27, ord("q")):
+                return None
+        elif ch in ("k", "j"):
+            pos = (pos + (-1 if ch == "k" else 1)) % len(options)
+        elif ch in ("\n", "\r"):
+            return pos
+        elif ch in ("q", "\x1b"):
+            return None
+
+
+def _ui_multi(title, options, initial=None, info=None) -> list:
+    """空格勾选，Enter 确认；返回选中的 value 列表，q/Esc 返回 None。"""
+    scr = _UI_SCREEN
+    if not options:
+        return None
+    info = list(info or [])
+    chosen = set(initial or [])
+    pos = 0
+    while True:
+        h, w = scr.getmaxyx()
+        rows = max(3, h - 9 - len(info))
+        start = max(0, min(pos - rows // 2, len(options) - rows))
+        visible = options[start:start + rows]
+        bw = min(w - 4, max(40, max([_ui_w(o[0]) for o in options] + [_ui_w(title)]) + 14))
+        bh = min(h - 2, len(info) + len(visible) + 5)
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        y = y0 + 1
+        for line in info:
+            if y >= y0 + bh - 3:
+                break
+            _ui_add(scr, y, x0 + 2, "  " + line, curses.A_DIM)
+            y += 1
+        if info:
+            y += 1
+        for i, (label, value) in enumerate(visible):
+            real = start + i
+            mark = "x" if value in chosen else " "
+            text = f"[{mark}] {label}"
+            attr = curses.A_REVERSE if real == pos else 0
+            _ui_add(scr, y, x0 + 2, " " + _ui_pad(text, bw - 6) + " ", attr)
+            y += 1
+        footer = f"{pos + 1}/{len(options)}  空格 切换  Enter 确认  q 取消" \
+            if len(options) > rows else "空格 切换  Enter 确认  q 取消"
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + footer + " ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                pos = (pos - 1) % len(options)
+            elif ch == curses.KEY_DOWN:
+                pos = (pos + 1) % len(options)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return [v for _, v in options if v in chosen]
+            elif ch in (27, ord("q")):
+                return None
+        elif ch == " ":
+            value = options[pos][1]
+            chosen.symmetric_difference_update({value})
+        elif ch in ("k", "j"):
+            pos = (pos + (-1 if ch == "k" else 1)) % len(options)
+        elif ch in ("\n", "\r"):
+            return [v for _, v in options if v in chosen]
+        elif ch in ("q", "\x1b"):
+            return None
+
+
+def _ui_input(title, default="", hint="", secret=False):
+    scr = _UI_SCREEN
+    buf = str(default)
+    pos = len(buf)
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(48, _ui_w(buf) + 10))
+        bh = 6
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        if hint:
+            _ui_add(scr, y0 + 1, x0 + 2, hint, curses.A_DIM)
+        shown = "*" * len(buf) if secret else buf
+        _ui_add(scr, y0 + 3, x0 + 2, shown[: bw - 4])
+        try:
+            curses.curs_set(1)
+            scr.move(y0 + 3, min(x0 + 2 + (_ui_w(buf[:pos]) if not secret else pos)
+                                 , w - 2))
+        except Exception:
+            pass
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " Enter 确认  Esc 取消 ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch in (10, 13, curses.KEY_ENTER):
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
+                return buf
+            if ch == 27:
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
+                return None
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if pos > 0:
+                    buf = buf[: pos - 1] + buf[pos:]
+                    pos -= 1
+            elif ch == curses.KEY_DC:
+                buf = buf[:pos] + buf[pos + 1:]
+            elif ch == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(buf)
+        elif isinstance(ch, str) and ch in ("\n", "\r"):
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+            return buf
+        elif isinstance(ch, str) and ch.isprintable():
+            buf = buf[:pos] + ch + buf[pos:]
+            pos += 1
+        elif ch == "\x1b":
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+            return None
+
+
+def _ui_confirm(title, default=True):
+    options = ["是", "否"] if default else ["否", "是"]
+    idx = _ui_choice(title, options, 0)
+    if idx is None:
+        return None
+    return options[idx] == "是"
+
+
+# ---------------------------------------------------------- 兼容旧调用接口
+def select_one(title, options, default=0, info=None):
+    if _UI_SCREEN is None:
+        return _select_one_raw(title, options, default=default, info=info)
+    _flush_output()
+    if not options:
+        return None
+    idx = _ui_choice(title, [label for label, _ in options],
+                     default=default, info=info)
+    return None if idx is None else options[idx][1]
+
+
+def select_multi(title, options, initial=None, info=None):
+    if _UI_SCREEN is None:
+        return _select_multi_raw(title, options, initial=initial, info=info)
+    _flush_output()
+    if not options:
+        return None
+    return _ui_multi(title, options, initial=initial, info=info)
+
+
+def read_line(prompt: str) -> str:
+    if _UI_SCREEN is None:
+        return _read_line_raw(prompt)
+    _flush_output()
+    title = prompt.strip().rstrip(":").strip() or "输入"
+    value = _ui_input(title)
+    return "" if value is None else value
+
+
+def read_secret(prompt: str) -> str:
+    if _UI_SCREEN is None:
+        return _read_secret_raw(prompt)
+    _flush_output()
+    title = prompt.strip().rstrip(":").strip() or "密码"
+    value = _ui_input(title, secret=True)
+    return "" if value is None else value
+
+
+def ask_text(prompt: str, default: str = "") -> str:
+    if _UI_SCREEN is None:
+        suffix = f" [{default}]" if default else ""
+        raw = _read_line_raw(f"{prompt}{suffix}: ")
+        return raw or default
+    _flush_output()
+    value = _ui_input(prompt, default=default)
+    if value is None:
+        return default
+    return value or default
+
+
+def pause() -> None:
+    if _UI_SCREEN is None:
+        return _pause_raw()
+    if _OUT_BUF:
+        _flush_output()
+    else:
+        _ui_msg("提示", "按任意键返回")
+
+
+# ------------------------------------------------------------ 仪表盘
+UI_GROUPS = [
+    ("共享与存储", [
+        ("SMB 管理", "smb_menu", "s"),
+        ("iSCSI 管理", "iscsi_menu", "i"),
+        ("ZFS 管理", "zfs_menu", "z"),
+    ]),
+    ("硬件", [
+        ("硬盘管理", "disk_menu", "d"),
+    ]),
+    ("系统", [
+        ("依赖检查 / 安装", "deps_menu", "e"),
+        ("系统集成 / 一键配置", "system_menu", "c"),
+        ("退出", "quit", "q"),
+    ]),
+]
+
+
+def _ui_info() -> list:
+    now = time.time()
+    if _INFO_CACHE["lines"] and now - _INFO_CACHE["ts"] < 5:
+        return _INFO_CACHE["lines"]
+    try:
+        lines = main_info_lines()
+    except Exception:
+        lines = ["状态读取失败"]
+    _INFO_CACHE.update(ts=now, lines=lines)
+    return lines
+
+
+def _ui_rows() -> list:
+    rows = []
+    for group, items in UI_GROUPS:
+        rows.append({"kind": "group", "label": group})
+        for label, key, hot in items:
+            rows.append({"kind": "item", "label": label, "key": key, "hot": hot})
+    return rows
+
+
+def _ui_first(rows) -> int:
+    for i, r in enumerate(rows):
+        if r["kind"] == "item":
+            return i
+    return 0
+
+
+def _ui_move(rows, sel, step) -> int:
+    for _ in range(len(rows)):
+        sel = (sel + step) % len(rows)
+        if rows[sel]["kind"] == "item":
+            return sel
+    return sel
+
+
+def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
+    scr.erase()
+    h, w = scr.getmaxyx()
+    if h < 16 or w < 52:
+        _ui_add(scr, 0, 0, "终端窗口太小，请调整到至少 52x16 后重试。")
+        scr.refresh()
+        return
+    info = _ui_info()
+    max_info = max(2, h - 16)
+    info = info[:max_info]
+    hh = len(info) + 2
+    _ui_box(scr, 0, 0, hh, w, f"nas {VERSION} · 管理面板")
+    for i, line in enumerate(info):
+        attr = 0
+        if any(k in line for k in ("告警", "未解锁", "异常", "未设置")):
+            attr = _ui_color(4)
+        _ui_add(scr, 1 + i, 2, line, attr)
+
+    y = hh + 1
+    for i, row in enumerate(rows):
+        if row["kind"] == "group":
+            _ui_add(scr, y, 2, row["label"], curses.A_BOLD | _ui_color(1))
+            y += 1
+            continue
+        selected = i == sel
+        left = ("▸ " if selected else "  ") + row["label"]
+        right = f"[{row['hot']}]"
+        text = " " + _ui_pad(left, max(1, w - 8 - _ui_w(right))) + right + " "
+        _ui_add(scr, y, 2, text, curses.A_REVERSE if selected else 0)
+        y += 1
+
+    _ui_add(scr, h - 2, 2, msg or "就绪", _ui_color(4))
+    _ui_add(scr, h - 1, 2,
+            " ↑/↓ 选择   Enter 执行   q 退出   快捷键见方括号 ", curses.A_DIM)
+
+
+def _ui_run_handler(scr, key) -> bool:
+    """执行菜单项；返回 True 表示退出。"""
+    if key == "quit":
+        return True
+    _flush_output()
+    try:
+        HANDLERS[key]()
+    except NasError as exc:
+        print(f"错误: {exc}")
+    except KeyboardInterrupt:
+        print("已取消")
+    _INFO_CACHE["ts"] = 0.0
+    _flush_output()
+    return False
+
+
+def _ui_dashboard(scr) -> None:
+    rows = _ui_rows()
+    sel = _ui_first(rows)
+    msg = ""
+    while True:
+        rows = _ui_rows()
+        _ui_draw_dashboard(scr, rows, sel, msg)
+        scr.refresh()
+        ch = _ui_key(scr)
+        msg = ""
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                sel = _ui_move(rows, sel, -1)
+            elif ch == curses.KEY_DOWN:
+                sel = _ui_move(rows, sel, 1)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                if _ui_run_handler(scr, rows[sel]["key"]):
+                    return
+            elif ch == 27:
+                return
+            continue
+        if ch in ("q", "\x1b"):
+            return
+        if ch in ("j", "k"):
+            sel = _ui_move(rows, sel, 1 if ch == "j" else -1)
+            continue
+        if ch in ("\n", "\r"):
+            if _ui_run_handler(scr, rows[sel]["key"]):
+                return
+            continue
+        hot = {r["hot"]: r["key"] for r in rows if r["kind"] == "item"}
+        if ch in hot:
+            if _ui_run_handler(scr, hot[ch]):
+                return
+
+
+def interactive() -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("nas 需要交互式终端（SSH 或本地控制台）。", file=sys.stderr)
+        return 2
+    if curses is None:
+        return _interactive_raw()
+
+    global _UI_SCREEN
+    old_stdout = sys.stdout
+    sys.stdout = _BufferedOut()
+    try:
+        def _main(scr):
+            global _UI_SCREEN
+            _UI_SCREEN = scr
+            _ui_setup(scr)
+            try:
+                _ui_dashboard(scr)
+            finally:
+                _UI_SCREEN = None
+
+        curses.wrapper(_main)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout = old_stdout
+    return 0
 
 
 LOGIN_SHELLS_EXCLUDE = {
@@ -5855,7 +6464,7 @@ def main_info_lines() -> list[str]:
     return lines
 
 
-def interactive() -> int:
+def _interactive_raw() -> int:
     if not sys.stdin.isatty():
         print("nas 需要交互式终端（SSH 或本地控制台）。", file=sys.stderr)
         return 2
