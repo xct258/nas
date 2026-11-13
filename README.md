@@ -82,6 +82,7 @@ ZFS 管理 → 自动快照，按计划为选中的数据集创建 `auto-YYYYmmd
 - 手动触发：菜单里「立即执行一次」，或 `NAS_AUTO_SNAPSHOT=1 nas`（定时器单元就是这么调的）
 - 状态：配置存于 `/var/lib/nas/auto-snapshot.json`，仪表盘和「系统集成」里能看到定时器状态与上次结果
 - 单元文件：`/etc/systemd/system/nas-auto-snapshot.service`、`nas-auto-snapshot.timer`
+- 硬盘休眠联动：配置了硬盘休眠时，执行前会用 `hdparm -C` 检查目标池的盘；有盘处于 standby/sleeping 就跳过本次，记入 `pending`，由 `nas-hdd-monitor` 每 60 秒轮询检测到盘唤醒后立即补做（`hdparm -C` 只查电源状态，不会把盘转起来）。补做依赖 `nas-hdd-monitor.service`，它由「系统集成」安装、配置硬盘休眠时一并启用
 
 ## 菜单结构
 

@@ -52,7 +52,7 @@ try:
 except ImportError:  # 极少见：无 curses 的 Python 环境退回原来的 ANSI 界面
     curses = None
 
-VERSION = "9.8"
+VERSION = "9.9"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -2544,11 +2544,13 @@ def load_auto_snapshot() -> dict:
         keep = int(data.get("keep", 7) or 0)
     except (TypeError, ValueError):
         keep = 7
+    pending = [str(x).strip() for x in data.get("pending", []) if str(x).strip()]
     return {
         "enabled": bool(data.get("enabled", False)),
         "oncalendar": str(data.get("oncalendar") or "*-*-* 03:00:00"),
         "keep": max(0, keep),
         "datasets": datasets,
+        "pending": pending,
         "last_run": str(data.get("last_run") or ""),
         "last_result": str(data.get("last_result") or ""),
     }
@@ -2556,6 +2558,11 @@ def load_auto_snapshot() -> dict:
 
 def save_auto_snapshot(data: dict) -> None:
     _write_json_file(AUTO_SNAP_FILE, data)
+
+
+def auto_snapshot_pending_watch() -> bool:
+    cfg = load_auto_snapshot()
+    return bool(cfg["enabled"] and cfg.get("pending"))
 
 
 def auto_snapshot_schedule_text(spec: str) -> str:
@@ -2584,8 +2591,33 @@ def _auto_snap_time(value: str) -> str | None:
     return f"{hour:02d}:{minute:02d}"
 
 
-def auto_snapshot_run() -> int:
-    """由 systemd timer 调用：为选中的数据集创建快照并按保留数清理。"""
+def auto_snapshot_sleeping_pools(datasets: list[str]) -> dict[str, list[str]]:
+    """返回 {池: [休眠中的磁盘]}；只在配置了硬盘休眠时检查。"""
+    if not load_hdd_sleep() or not shutil.which("hdparm"):
+        return {}
+    pools = {name.split("/", 1)[0] for name in datasets if name}
+    if not pools:
+        return {}
+    try:
+        mapping = disk_pool_map()
+    except NasError:
+        return {}
+    result: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for path, pool in mapping.items():
+        if pool not in pools or path in seen:
+            continue
+        seen.add(path)
+        if hdd_power_code(path) in ("standby", "sleeping"):
+            result.setdefault(pool, []).append(os.path.basename(path))
+    return result
+
+
+def auto_snapshot_run(only_pending: bool = False) -> int:
+    """创建快照并按保留数清理。
+
+    配置了硬盘休眠时，磁盘处于休眠的池会跳过本次并在唤醒后补做。
+    """
     if not zfs_available():
         print("zfs 不可用，跳过自动快照")
         return 1
@@ -2593,14 +2625,24 @@ def auto_snapshot_run() -> int:
     if not cfg["enabled"]:
         print("自动快照未启用")
         return 0
-    datasets = [name for name in cfg["datasets"] if zfs_dataset_exists(name)]
-    if not datasets:
-        print("没有可用的数据集")
-        return 1
+    pending = set(cfg.get("pending", []))
+    targets = (sorted(pending) if only_pending else list(cfg["datasets"]))
+    if not targets:
+        return 0
 
+    sleeping = auto_snapshot_sleeping_pools(targets)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    created = pruned = failed = 0
-    for dataset in datasets:
+    created = pruned = failed = deferred = 0
+    for dataset in targets:
+        pool = dataset.split("/", 1)[0]
+        if pool in sleeping:
+            deferred += 1
+            pending.add(dataset)
+            continue
+        if not zfs_dataset_exists(dataset):
+            print(f"跳过不存在的数据集: {dataset}")
+            pending.discard(dataset)
+            continue
         snapshot = f"{dataset}@{AUTO_SNAP_PREFIX}{stamp}"
         proc = run(["zfs", "snapshot", snapshot], check=False)
         if proc.returncode != 0:
@@ -2609,6 +2651,7 @@ def auto_snapshot_run() -> int:
             failed += 1
             continue
         created += 1
+        pending.discard(dataset)
         keep = cfg["keep"]
         if keep <= 0:
             continue
@@ -2618,8 +2661,22 @@ def auto_snapshot_run() -> int:
             if run(["zfs", "destroy", row["name"]], check=False).returncode == 0:
                 pruned += 1
 
+    cfg["pending"] = sorted(pending)
     cfg["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    cfg["last_result"] = f"新建 {created}，清理 {pruned}，失败 {failed}"
+    parts = []
+    if created:
+        parts.append(f"新建 {created}")
+    if pruned:
+        parts.append(f"清理 {pruned}")
+    if failed:
+        parts.append(f"失败 {failed}")
+    if deferred:
+        names = "、".join(f"{pool}({','.join(disks)})"
+                         for pool, disks in sleeping.items())
+        parts.append(f"休眠跳过 {deferred}（{names}），待唤醒补做")
+    if not parts:
+        parts.append("无需处理")
+    cfg["last_result"] = "，".join(parts)
     save_auto_snapshot(cfg)
     print(f"自动快照 {cfg['last_run']}：{cfg['last_result']}")
     return 0 if failed == 0 else 1
@@ -2699,6 +2756,8 @@ def ui_auto_snapshot_menu() -> None:
             f"数据集  {'、'.join(cfg['datasets']) or '(未选择)'}",
             f"上次    {cfg['last_run'] or '无'}  {cfg['last_result']}",
         ]
+        if cfg.get("pending"):
+            info.append(f"待补    {len(cfg['pending'])} 个（硬盘休眠中，唤醒后自动补做）")
         choice = select_one("自动快照", [
             ("关闭自动快照" if cfg["enabled"] else "开启自动快照", "toggle"),
             ("设置计划", "schedule"),
@@ -3251,7 +3310,8 @@ def hdd_monitor() -> int:
         interval = max(10, int(os.environ.get("NAS_HDD_MONITOR_INTERVAL", "60")))
     except ValueError:
         interval = 60
-    if not load_hdd_sleep() and not space_monitor_needed():
+    if not load_hdd_sleep() and not space_monitor_needed() \
+            and not auto_snapshot_pending_watch():
         print("nas-hdd-monitor: 没有配置休眠或空间监控，退出", flush=True)
         return 0
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -3263,9 +3323,11 @@ def hdd_monitor() -> int:
         monitor_lock.close()
         return 0
     previous = load_hdd_status()
+    last_catchup = 0.0
     print(f"nas-hdd-monitor: 启动，间隔 {interval}s", flush=True)
     while True:
-        if not load_hdd_sleep() and not space_monitor_needed():
+        if not load_hdd_sleep() and not space_monitor_needed() \
+                and not auto_snapshot_pending_watch():
             print("nas-hdd-monitor: 没有配置休眠或空间监控，退出", flush=True)
             return 0
         current: dict[str, dict] = {}
@@ -3278,6 +3340,17 @@ def hdd_monitor() -> int:
             print(f"读取磁盘列表失败: {exc}", flush=True)
             time.sleep(interval)
             continue
+        auto_cfg = load_auto_snapshot()
+        if auto_cfg["enabled"] and auto_cfg.get("pending") \
+                and now - last_catchup >= 300 \
+                and not auto_snapshot_sleeping_pools(auto_cfg["pending"]):
+            last_catchup = now
+            print("nas-hdd-monitor: 硬盘已唤醒，补做自动快照", flush=True)
+            try:
+                auto_snapshot_run(only_pending=True)
+            except NasError as exc:
+                print(f"自动快照补做失败: {exc}", flush=True)
+
         for disk in disks:
             if not disk.get("rota"):
                 continue
@@ -6745,6 +6818,7 @@ def main_info_lines() -> list[str]:
             lines.append(
                 f"快照   自动快照 {auto_snapshot_schedule_text(auto['oncalendar'])}"
                 f" · 保留 {auto['keep'] or '不限'} 份 · {len(auto['datasets'])} 个数据集"
+                + (f" · 待补 {len(auto['pending'])}" if auto.get("pending") else "")
             )
     except NasError:
         pass
