@@ -16,6 +16,7 @@
 | 用户 | 查看、添加、重置密码、启用/禁用、删除（可同时删除 Linux 用户） |
 | iSCSI | 新建/删除 iSCSI 磁盘、ZFS zvol、initiator ACL、CHAP、Portal |
 | ZFS | 存储池状态、scrub、数据集/zvol 创建删除、快照创建/回滚/删除、加密数据集密钥管理 |
+| 自动快照 | 按计划为选中的数据集创建 ZFS 快照，自动清理超过保留份数的旧快照 |
 | 硬盘 | 磁盘列表、SMART、机械硬盘休眠/状态监控/异常唤醒保护/推送提醒、系统盘/ZFS 池空间监控、创建/导入 ZFS 池 |
 | 加密联动 | 未解锁时访问被拒绝、停止导出 iSCSI LUN；解锁后自动挂载/恢复 |
 | 依赖 | 检查 ZFS / SMB / iSCSI / wsdd2，按缺失项安装 |
@@ -70,6 +71,17 @@ Enter   确认
 空格    多选时切换勾选
 q / Esc 返回上一级
 ```
+
+## 自动快照
+
+ZFS 管理 → 自动快照，按计划为选中的数据集创建 `auto-YYYYmmdd-HHMMSS` 快照，并按保留份数清理旧的自动快照（只清理 `auto-` 前缀，手动快照不动）。
+
+- 计划：每小时整点、每 6 小时（00/06/12/18）、每天指定时间、每周指定时间
+- 保留：每个数据集各自保留最新 N 份，`0` 表示不清理
+- 执行：`nas-auto-snapshot.timer` 触发 `/usr/local/bin/nas`（`NAS_AUTO_SNAPSHOT=1`），开机错过的任务会补跑一次
+- 手动触发：菜单里「立即执行一次」，或 `NAS_AUTO_SNAPSHOT=1 nas`（定时器单元就是这么调的）
+- 状态：配置存于 `/var/lib/nas/auto-snapshot.json`，仪表盘和「系统集成」里能看到定时器状态与上次结果
+- 单元文件：`/etc/systemd/system/nas-auto-snapshot.service`、`nas-auto-snapshot.timer`
 
 ## 菜单结构
 

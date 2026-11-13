@@ -52,7 +52,7 @@ try:
 except ImportError:  # 极少见：无 curses 的 Python 环境退回原来的 ANSI 界面
     curses = None
 
-VERSION = "9.7"
+VERSION = "9.8"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -62,6 +62,10 @@ LOCKED_SHARES_FILE = STATE_DIR / "locked-shares.json"
 VETO_SHARES_FILE = STATE_DIR / "veto-shares.json"
 HIDE_SHARES_FILE = STATE_DIR / "hide-unreadable-shares.json"
 HDD_SLEEP_FILE = STATE_DIR / "hdd-sleep.json"
+AUTO_SNAP_FILE = STATE_DIR / "auto-snapshot.json"
+AUTO_SNAP_UNIT = Path("/etc/systemd/system/nas-auto-snapshot.service")
+AUTO_SNAP_TIMER = Path("/etc/systemd/system/nas-auto-snapshot.timer")
+AUTO_SNAP_PREFIX = "auto-"
 HDD_SLEEP_UNIT = Path("/etc/systemd/system/nas-hdd-sleep.service")
 HDD_STATUS_FILE = STATE_DIR / "hdd-status.json"
 HDD_ALERT_FILE = STATE_DIR / "hdd-sleep-alerts.json"
@@ -82,6 +86,7 @@ APT_DIR = Path(os.environ.get("NAS_APT_DIR", "/etc/apt"))
 GUARD_UNIT = Path("/etc/systemd/system/nas-lock-guard.service")
 INSTALL_PATH = Path(os.environ.get("NAS_INSTALL_PATH", "/usr/local/bin/nas"))
 BOOT_GUARD = os.environ.get("NAS_BOOT_GUARD") == "1"
+AUTO_SNAPSHOT = os.environ.get("NAS_AUTO_SNAPSHOT") == "1"
 ALLOWED_ROOTS = [
     Path(p).resolve()
     for p in os.environ.get("NAS_ROOTS", "/mnt,/srv,/home").split(",")
@@ -2525,6 +2530,279 @@ def cmd_zfs_snapshot_rollback(args) -> None:
     print(f"已回滚到 {snapshot}")
 
 
+# ------------------------------------------------------------ 自动快照
+AUTO_SNAP_DAYS = {
+    "Mon": "周一", "Tue": "周二", "Wed": "周三", "Thu": "周四",
+    "Fri": "周五", "Sat": "周六", "Sun": "周日",
+}
+
+
+def load_auto_snapshot() -> dict:
+    data = _read_json_file(AUTO_SNAP_FILE, {})
+    datasets = [str(x).strip() for x in data.get("datasets", []) if str(x).strip()]
+    try:
+        keep = int(data.get("keep", 7) or 0)
+    except (TypeError, ValueError):
+        keep = 7
+    return {
+        "enabled": bool(data.get("enabled", False)),
+        "oncalendar": str(data.get("oncalendar") or "*-*-* 03:00:00"),
+        "keep": max(0, keep),
+        "datasets": datasets,
+        "last_run": str(data.get("last_run") or ""),
+        "last_result": str(data.get("last_result") or ""),
+    }
+
+
+def save_auto_snapshot(data: dict) -> None:
+    _write_json_file(AUTO_SNAP_FILE, data)
+
+
+def auto_snapshot_schedule_text(spec: str) -> str:
+    spec = (spec or "").strip()
+    if spec == "*-*-* *:00:00":
+        return "每小时整点"
+    if spec == "*-*-* 00,06,12,18:00:00":
+        return "每 6 小时"
+    match = re.fullmatch(r"\*-\*-\* (\d{2}):(\d{2}):00", spec)
+    if match:
+        return f"每天 {match.group(1)}:{match.group(2)}"
+    match = re.fullmatch(
+        r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \*-\*-\* (\d{2}):(\d{2}):00", spec)
+    if match:
+        return f"每{AUTO_SNAP_DAYS[match.group(1)]} {match.group(2)}:{match.group(3)}"
+    return spec or "-"
+
+
+def _auto_snap_time(value: str) -> str | None:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def auto_snapshot_run() -> int:
+    """由 systemd timer 调用：为选中的数据集创建快照并按保留数清理。"""
+    if not zfs_available():
+        print("zfs 不可用，跳过自动快照")
+        return 1
+    cfg = load_auto_snapshot()
+    if not cfg["enabled"]:
+        print("自动快照未启用")
+        return 0
+    datasets = [name for name in cfg["datasets"] if zfs_dataset_exists(name)]
+    if not datasets:
+        print("没有可用的数据集")
+        return 1
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    created = pruned = failed = 0
+    for dataset in datasets:
+        snapshot = f"{dataset}@{AUTO_SNAP_PREFIX}{stamp}"
+        proc = run(["zfs", "snapshot", snapshot], check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:200]
+            print(f"创建失败 {snapshot}: {detail}")
+            failed += 1
+            continue
+        created += 1
+        keep = cfg["keep"]
+        if keep <= 0:
+            continue
+        rows = [row for row in zfs_snapshots(dataset)
+                if row["snapshot"].startswith(AUTO_SNAP_PREFIX)]
+        for row in rows[:-keep]:
+            if run(["zfs", "destroy", row["name"]], check=False).returncode == 0:
+                pruned += 1
+
+    cfg["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cfg["last_result"] = f"新建 {created}，清理 {pruned}，失败 {failed}"
+    save_auto_snapshot(cfg)
+    print(f"自动快照 {cfg['last_run']}：{cfg['last_result']}")
+    return 0 if failed == 0 else 1
+
+
+AUTO_SNAP_SERVICE_TEXT = """[Unit]
+Description=NAS automatic ZFS snapshots
+After=zfs-mount.service
+ConditionPathExists={install}
+
+[Service]
+Type=oneshot
+Environment=NAS_AUTO_SNAPSHOT=1
+ExecStart={install}
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900
+"""
+
+AUTO_SNAP_TIMER_TEXT = """[Unit]
+Description=NAS automatic ZFS snapshot timer
+
+[Timer]
+OnCalendar={schedule}
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _write_unit(path: Path, text: str) -> bool:
+    changed = True
+    try:
+        changed = path.read_text(encoding="utf-8") != text
+    except OSError:
+        pass
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    return changed
+
+
+def install_auto_snapshot_units(cfg: dict) -> None:
+    need_root()
+    _write_unit(AUTO_SNAP_UNIT,
+                AUTO_SNAP_SERVICE_TEXT.format(install=str(INSTALL_PATH)))
+    _write_unit(AUTO_SNAP_TIMER,
+                AUTO_SNAP_TIMER_TEXT.format(schedule=cfg["oncalendar"]))
+    run(["systemctl", "daemon-reload"], check=True)
+    if cfg["enabled"]:
+        run(["systemctl", "enable", "--now", "nas-auto-snapshot.timer"], check=True)
+    else:
+        run(["systemctl", "disable", "--now", "nas-auto-snapshot.timer"], check=False)
+
+
+def auto_snapshot_timer_state() -> str:
+    if not AUTO_SNAP_TIMER.exists():
+        return "未安装"
+    return _service_state("nas-auto-snapshot.timer")
+
+
+def ui_auto_snapshot_menu() -> None:
+    if not zfs_available():
+        print("未安装 ZFS：apt install zfsutils-linux")
+        return
+    while True:
+        cfg = load_auto_snapshot()
+        info = [
+            f"状态    {'已开启' if cfg['enabled'] else '已关闭'}（定时器 {auto_snapshot_timer_state()}）",
+            f"计划    {auto_snapshot_schedule_text(cfg['oncalendar'])}",
+            f"保留    {cfg['keep'] or '不清理'} 份自动快照",
+            f"数据集  {'、'.join(cfg['datasets']) or '(未选择)'}",
+            f"上次    {cfg['last_run'] or '无'}  {cfg['last_result']}",
+        ]
+        choice = select_one("自动快照", [
+            ("关闭自动快照" if cfg["enabled"] else "开启自动快照", "toggle"),
+            ("设置计划", "schedule"),
+            ("选择数据集", "datasets"),
+            ("设置保留份数", "keep"),
+            ("立即执行一次", "now"),
+            ("返回", "back"),
+        ], info=info)
+        if choice in (None, "back"):
+            return
+
+        if choice == "toggle":
+            if not cfg["enabled"]:
+                if not cfg["datasets"]:
+                    print("请先选择要自动快照的数据集。")
+                    continue
+                if not ask_confirm("开启后按计划自动创建 ZFS 快照并清理旧快照？", True):
+                    continue
+            cfg["enabled"] = not cfg["enabled"]
+            save_auto_snapshot(cfg)
+            install_auto_snapshot_units(cfg)
+            print("已开启自动快照" if cfg["enabled"] else "已关闭自动快照")
+            pause()
+
+        elif choice == "schedule":
+            preset = select_one("快照计划", [
+                ("每小时整点", "hourly"),
+                ("每 6 小时（00/06/12/18 点）", "six"),
+                ("每天指定时间", "daily"),
+                ("每周指定时间", "weekly"),
+                ("返回", "back"),
+            ])
+            if preset in (None, "back"):
+                continue
+            if preset == "hourly":
+                cfg["oncalendar"] = "*-*-* *:00:00"
+            elif preset == "six":
+                cfg["oncalendar"] = "*-*-* 00,06,12,18:00:00"
+            else:
+                day = ""
+                if preset == "weekly":
+                    day = select_one("星期", [
+                        ("周一", "Mon"), ("周二", "Tue"), ("周三", "Wed"),
+                        ("周四", "Thu"), ("周五", "Fri"), ("周六", "Sat"),
+                        ("周日", "Sun"), ("返回", "back"),
+                    ])
+                    if day in (None, "back"):
+                        continue
+                value = ask_text("时间（HH:MM）", "03:00")
+                clock = _auto_snap_time(value)
+                if not clock:
+                    print("时间格式不正确，应为 HH:MM。")
+                    pause()
+                    continue
+                if day:
+                    cfg["oncalendar"] = f"{day} *-*-* {clock}:00"
+                else:
+                    cfg["oncalendar"] = f"*-*-* {clock}:00"
+            save_auto_snapshot(cfg)
+            if AUTO_SNAP_TIMER.exists():
+                install_auto_snapshot_units(cfg)
+            print(f"计划已改为 {auto_snapshot_schedule_text(cfg['oncalendar'])}")
+            pause()
+
+        elif choice == "datasets":
+            rows = [row for row in zfs_datasets() if row["type"] == "filesystem"]
+            if not rows:
+                print("没有可用的文件系统数据集。")
+                pause()
+                continue
+            picked = select_multi(
+                "选择要自动快照的数据集",
+                [(row["name"], row["name"]) for row in rows],
+                initial=[name for name in cfg["datasets"]
+                         if name in {row["name"] for row in rows}],
+                info=["只对选中的数据集创建快照，子数据集不自动包含"],
+            )
+            if picked is None:
+                continue
+            cfg["datasets"] = list(picked)
+            save_auto_snapshot(cfg)
+            print(f"已选择 {len(picked)} 个数据集")
+            pause()
+
+        elif choice == "keep":
+            value = ask_text("保留份数（0 表示不清理）", str(cfg["keep"]))
+            if not value.isdigit():
+                print("请输入非负整数。")
+                pause()
+                continue
+            cfg["keep"] = int(value)
+            save_auto_snapshot(cfg)
+            print(f"保留份数已设为 {cfg['keep'] or '不清理'}")
+            pause()
+
+        elif choice == "now":
+            if not cfg["datasets"]:
+                print("请先选择要自动快照的数据集。")
+                pause()
+                continue
+            auto_snapshot_run()
+            pause()
+
+
 # ---------------------------------------------------------------- disks
 
 POOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,62}$")
@@ -3622,6 +3900,18 @@ def _ui_w(s) -> int:
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
 
 
+def _ui_trunc(s, cells: int) -> str:
+    out = []
+    used = 0
+    for ch in str(s):
+        cw = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used + cw > cells:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
 def _ui_pad(s, width: int) -> str:
     s = str(s)
     return s + " " * max(0, width - _ui_w(s))
@@ -3712,7 +4002,7 @@ def _ui_pager(title, text) -> None:
     top = 0
     while True:
         h, w = scr.getmaxyx()
-        scr.erase()
+        scr.clear()
         _ui_box(scr, 0, 0, h, w, title)
         body = max(1, h - 4)
         for i, ln in enumerate(lines[top: top + body]):
@@ -3751,7 +4041,7 @@ def _ui_msg(title, text, wait="按任意键返回") -> None:
         bh = min(h - 2, len(lines) + 4)
         y0 = max(0, (h - bh) // 2)
         x0 = max(0, (w - bw) // 2)
-        scr.erase()
+        scr.clear()
         _ui_box(scr, y0, x0, bh, bw, title)
         for i, ln in enumerate(lines[: bh - 3]):
             _ui_add(scr, y0 + 2 + i, x0 + 2, ln)
@@ -3778,24 +4068,26 @@ def _ui_choice(title, options, default=0, info=None):
         rows = max_rows(h)
         start = max(0, min(pos - rows // 2, len(options) - rows))
         visible = options[start:start + rows]
-        bw = min(w - 4, max(40, max([_ui_w(o) for o in options] + [_ui_w(title)]) + 10))
+        bw = min(w - 4, max(40, max([_ui_w(o) for o in options]
+                                   + [_ui_w(title)] + [_ui_w(x) for x in info]) + 10))
         bh = min(h - 2, len(info) + len(visible) + 5)
         y0 = max(0, (h - bh) // 2)
         x0 = max(0, (w - bw) // 2)
-        scr.erase()
+        scr.clear()
         _ui_box(scr, y0, x0, bh, bw, title)
         y = y0 + 1
         for line in info:
             if y >= y0 + bh - 3:
                 break
-            _ui_add(scr, y, x0 + 2, "  " + line, curses.A_DIM)
+            _ui_add(scr, y, x0 + 2, "  " + _ui_trunc(line, bw - 4), curses.A_DIM)
             y += 1
         if info:
             y += 1
         for i, opt in enumerate(visible):
             real = start + i
             attr = curses.A_REVERSE if real == pos else 0
-            _ui_add(scr, y, x0 + 2, " " + _ui_pad(opt, bw - 6) + " ", attr)
+            _ui_add(scr, y, x0 + 2,
+                    " " + _ui_pad(_ui_trunc(opt, bw - 6), bw - 6) + " ", attr)
             y += 1
         if start > 0:
             _ui_add(scr, y0 + 1, x0 + bw - 3, "…")
@@ -3804,7 +4096,7 @@ def _ui_choice(title, options, default=0, info=None):
         footer = ("↑/↓ 选择  Enter 确认  q 取消"
                   if len(options) <= rows else
                   f"{pos + 1}/{len(options)}  ↑/↓ 选择  Enter 确认  q 取消")
-        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + footer + " ")
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + _ui_trunc(footer, bw - 4) + " ")
         scr.refresh()
         ch = _ui_key(scr)
         if isinstance(ch, int):
@@ -3841,17 +4133,18 @@ def _ui_multi(title, options, initial=None, info=None) -> list:
         rows = max(3, h - 9 - len(info))
         start = max(0, min(pos - rows // 2, len(options) - rows))
         visible = options[start:start + rows]
-        bw = min(w - 4, max(40, max([_ui_w(o[0]) for o in options] + [_ui_w(title)]) + 14))
+        bw = min(w - 4, max(40, max([_ui_w(o[0]) for o in options]
+                                   + [_ui_w(title)] + [_ui_w(x) for x in info]) + 14))
         bh = min(h - 2, len(info) + len(visible) + 5)
         y0 = max(0, (h - bh) // 2)
         x0 = max(0, (w - bw) // 2)
-        scr.erase()
+        scr.clear()
         _ui_box(scr, y0, x0, bh, bw, title)
         y = y0 + 1
         for line in info:
             if y >= y0 + bh - 3:
                 break
-            _ui_add(scr, y, x0 + 2, "  " + line, curses.A_DIM)
+            _ui_add(scr, y, x0 + 2, "  " + _ui_trunc(line, bw - 4), curses.A_DIM)
             y += 1
         if info:
             y += 1
@@ -3860,11 +4153,12 @@ def _ui_multi(title, options, initial=None, info=None) -> list:
             mark = "x" if value in chosen else " "
             text = f"[{mark}] {label}"
             attr = curses.A_REVERSE if real == pos else 0
-            _ui_add(scr, y, x0 + 2, " " + _ui_pad(text, bw - 6) + " ", attr)
+            _ui_add(scr, y, x0 + 2,
+                    " " + _ui_pad(_ui_trunc(text, bw - 6), bw - 6) + " ", attr)
             y += 1
         footer = f"{pos + 1}/{len(options)}  空格 切换  Enter 确认  q 取消" \
             if len(options) > rows else "空格 切换  Enter 确认  q 取消"
-        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + footer + " ")
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + _ui_trunc(footer, bw - 4) + " ")
         scr.refresh()
         ch = _ui_key(scr)
         if isinstance(ch, int):
@@ -3897,7 +4191,7 @@ def _ui_input(title, default="", hint="", secret=False):
         bh = 6
         y0 = max(0, (h - bh) // 2)
         x0 = max(0, (w - bw) // 2)
-        scr.erase()
+        scr.clear()
         _ui_box(scr, y0, x0, bh, bw, title)
         if hint:
             _ui_add(scr, y0 + 1, x0 + 2, hint, curses.A_DIM)
@@ -4079,7 +4373,7 @@ def _ui_move(rows, sel, step) -> int:
 
 
 def _ui_draw_dashboard(scr, rows, sel) -> None:
-    scr.erase()
+    scr.clear()
     h, w = scr.getmaxyx()
     if h < 16 or w < 52:
         _ui_add(scr, 0, 0, "终端窗口太小，请调整到至少 52x16 后重试。")
@@ -5374,6 +5668,7 @@ def ui_zfs_menu() -> None:
             ("存储池", "pools"),
             ("数据集", "datasets"),
             ("快照", "snapshots"),
+            ("自动快照", "auto_snapshot"),
             ("密钥管理", "encryption"),
             ("返回", "back"),
         ])
@@ -5385,6 +5680,8 @@ def ui_zfs_menu() -> None:
             ui_zfs_datasets()
         elif choice == "snapshots":
             ui_zfs_snapshots()
+        elif choice == "auto_snapshot":
+            ui_auto_snapshot_menu()
         elif choice == "encryption":
             ui_zfs_encryption()
 
@@ -6137,6 +6434,13 @@ def system_status_lines() -> list[str]:
             f"{_unit_state('nas-hdd-monitor.service', 'is-active')}"
         )
 
+    if AUTO_SNAP_TIMER.exists():
+        lines.append(
+            "自动快照  "
+            f"{_unit_state('nas-auto-snapshot.timer', 'is-enabled')} · "
+            f"{_unit_state('nas-auto-snapshot.timer', 'is-active')}"
+        )
+
     if unit_exists("zfs-load-key.service"):
         lines.append(f"自动解锁  {_unit_state('zfs-load-key.service', 'is-enabled')}（应为 masked）")
 
@@ -6435,6 +6739,15 @@ def main_info_lines() -> list[str]:
                     )
         except NasError:
             pass
+    try:
+        auto = load_auto_snapshot()
+        if auto["enabled"]:
+            lines.append(
+                f"快照   自动快照 {auto_snapshot_schedule_text(auto['oncalendar'])}"
+                f" · 保留 {auto['keep'] or '不限'} 份 · {len(auto['datasets'])} 个数据集"
+            )
+    except NasError:
+        pass
     if shutil.which("targetcli"):
         target_count = len(iscsi_targets())
         service = _service_state("rtslib-fb-targetctl")
@@ -6495,6 +6808,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if argv is None:
         self_install()
+    if AUTO_SNAPSHOT:
+        return auto_snapshot_run()
     if HDD_SLEEP:
         apply_hdd_sleep_settings()
     if HDD_MONITOR:
