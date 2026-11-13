@@ -30,6 +30,7 @@ exec python3 "$0" "$@"
 
 import fcntl
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -52,7 +53,7 @@ try:
 except ImportError:  # 极少见：无 curses 的 Python 环境退回原来的 ANSI 界面
     curses = None
 
-VERSION = "9.9"
+VERSION = "9.10"
 
 SMB_CONF = Path(os.environ.get("NAS_SMB_CONF", "/etc/samba/smb.conf"))
 BACKUP_DIR = Path(os.environ.get("NAS_BACKUP_DIR", "/var/backups/nas"))
@@ -2535,19 +2536,48 @@ AUTO_SNAP_DAYS = {
     "Mon": "周一", "Tue": "周二", "Wed": "周三", "Thu": "周四",
     "Fri": "周五", "Sat": "周六", "Sun": "周日",
 }
+AUTO_SNAP_UNIT_NAME = "nas-auto-snapshot"
+
+
+def _snap_tag(spec: str) -> str:
+    return hashlib.md5(spec.encode("utf-8")).hexdigest()[:8]
+
+
+def _snap_unit_paths(spec: str) -> tuple[Path, Path]:
+    base = Path("/etc/systemd/system") / f"{AUTO_SNAP_UNIT_NAME}-{_snap_tag(spec)}"
+    return base.with_name(base.name + ".service"), base.with_name(base.name + ".timer")
 
 
 def load_auto_snapshot() -> dict:
     data = _read_json_file(AUTO_SNAP_FILE, {})
-    datasets = [str(x).strip() for x in data.get("datasets", []) if str(x).strip()]
+    default_sched = str(data.get("oncalendar") or "*-*-* 03:00:00").strip()
     try:
         keep = int(data.get("keep", 7) or 0)
     except (TypeError, ValueError):
         keep = 7
+    datasets: list[dict] = []
+    raw = data.get("datasets", [])
+    if isinstance(raw, dict):
+        items = raw.items()
+    elif isinstance(raw, list):
+        items = [(item, {}) if isinstance(item, str) else
+                 (item.get("name", ""), item) for item in raw]
+    else:
+        items = []
+    for name, value in items:
+        name = str(name).strip()
+        if not name:
+            continue
+        spec = default_sched
+        if isinstance(value, dict):
+            spec = str(value.get("oncalendar") or default_sched).strip()
+        elif isinstance(value, str) and value.strip():
+            spec = value.strip()
+        datasets.append({"name": name, "oncalendar": spec or default_sched})
     pending = [str(x).strip() for x in data.get("pending", []) if str(x).strip()]
     return {
         "enabled": bool(data.get("enabled", False)),
-        "oncalendar": str(data.get("oncalendar") or "*-*-* 03:00:00"),
+        "oncalendar": default_sched or "*-*-* 03:00:00",
         "keep": max(0, keep),
         "datasets": datasets,
         "pending": pending,
@@ -2557,7 +2587,30 @@ def load_auto_snapshot() -> dict:
 
 
 def save_auto_snapshot(data: dict) -> None:
-    _write_json_file(AUTO_SNAP_FILE, data)
+    out = dict(data)
+    out["datasets"] = {row["name"]: {"oncalendar": row["oncalendar"]}
+                       for row in data.get("datasets", [])}
+    _write_json_file(AUTO_SNAP_FILE, out)
+
+
+def auto_snapshot_dataset_names(cfg: dict) -> list[str]:
+    return [row["name"] for row in cfg.get("datasets", [])]
+
+
+def auto_snapshot_effective_schedule(cfg: dict, name: str) -> str:
+    for row in cfg.get("datasets", []):
+        if row["name"] == name:
+            return row.get("oncalendar") or cfg.get("oncalendar") or ""
+    return cfg.get("oncalendar") or ""
+
+
+def auto_snapshot_schedule_groups(cfg: dict) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for row in cfg.get("datasets", []):
+        spec = row.get("oncalendar") or cfg.get("oncalendar") or ""
+        if spec:
+            groups.setdefault(spec, []).append(row["name"])
+    return groups
 
 
 def auto_snapshot_pending_watch() -> bool:
@@ -2613,10 +2666,12 @@ def auto_snapshot_sleeping_pools(datasets: list[str]) -> dict[str, list[str]]:
     return result
 
 
-def auto_snapshot_run(only_pending: bool = False) -> int:
+def auto_snapshot_run(only_pending: bool = False,
+                      schedule: str | None = None) -> int:
     """创建快照并按保留数清理。
 
-    配置了硬盘休眠时，磁盘处于休眠的池会跳过本次并在唤醒后补做。
+    schedule 为 None 时处理所有数据集；否则只处理该计划下的数据集。
+    only_pending=True 用于硬盘唤醒后的补做。
     """
     if not zfs_available():
         print("zfs 不可用，跳过自动快照")
@@ -2626,7 +2681,15 @@ def auto_snapshot_run(only_pending: bool = False) -> int:
         print("自动快照未启用")
         return 0
     pending = set(cfg.get("pending", []))
-    targets = (sorted(pending) if only_pending else list(cfg["datasets"]))
+    if only_pending:
+        known = set(auto_snapshot_dataset_names(cfg))
+        targets = sorted(pending & known)
+        pending &= known
+    elif schedule:
+        targets = [row["name"] for row in cfg["datasets"]
+                   if row["oncalendar"] == schedule]
+    else:
+        targets = auto_snapshot_dataset_names(cfg)
     if not targets:
         return 0
 
@@ -2683,13 +2746,14 @@ def auto_snapshot_run(only_pending: bool = False) -> int:
 
 
 AUTO_SNAP_SERVICE_TEXT = """[Unit]
-Description=NAS automatic ZFS snapshots
+Description=NAS automatic ZFS snapshots ({schedule})
 After=zfs-mount.service
 ConditionPathExists={install}
 
 [Service]
 Type=oneshot
 Environment=NAS_AUTO_SNAPSHOT=1
+Environment="NAS_AUTO_SNAPSHOT_SCHEDULE={schedule}"
 ExecStart={install}
 Nice=10
 IOSchedulingClass=idle
@@ -2697,7 +2761,7 @@ TimeoutStartSec=900
 """
 
 AUTO_SNAP_TIMER_TEXT = """[Unit]
-Description=NAS automatic ZFS snapshot timer
+Description=NAS automatic ZFS snapshot timer ({schedule})
 
 [Timer]
 OnCalendar={schedule}
@@ -2724,23 +2788,121 @@ def _write_unit(path: Path, text: str) -> bool:
     return changed
 
 
-def install_auto_snapshot_units(cfg: dict) -> None:
+def sync_auto_snapshot_timers(cfg: dict) -> None:
+    """按每个数据集各自的计划重建 timer，每个计划一个单元。"""
     need_root()
-    _write_unit(AUTO_SNAP_UNIT,
-                AUTO_SNAP_SERVICE_TEXT.format(install=str(INSTALL_PATH)))
-    _write_unit(AUTO_SNAP_TIMER,
-                AUTO_SNAP_TIMER_TEXT.format(schedule=cfg["oncalendar"]))
+    groups = auto_snapshot_schedule_groups(cfg) if cfg["enabled"] else {}
+    wanted = {}
+    for spec in groups:
+        svc, tmr = _snap_unit_paths(spec)
+        wanted[svc.name] = spec
+        _write_unit(svc, AUTO_SNAP_SERVICE_TEXT.format(
+            schedule=spec, install=str(INSTALL_PATH)))
+        _write_unit(tmr, AUTO_SNAP_TIMER_TEXT.format(schedule=spec))
+
+    unit_dir = Path("/etc/systemd/system")
+    for path in unit_dir.glob(f"{AUTO_SNAP_UNIT_NAME}-*.service"):
+        if path.name not in wanted:
+            timer = path.with_suffix(".timer")
+            run(["systemctl", "disable", "--now", timer.name], check=False)
+            for item in (path, timer):
+                try:
+                    item.unlink()
+                except OSError:
+                    pass
+    # 旧版本的单实例单元
+    for legacy in (unit_dir / f"{AUTO_SNAP_UNIT_NAME}.timer",
+                   unit_dir / f"{AUTO_SNAP_UNIT_NAME}.service"):
+        if legacy.exists():
+            if legacy.suffix == ".timer":
+                run(["systemctl", "disable", "--now", legacy.name], check=False)
+            try:
+                legacy.unlink()
+            except OSError:
+                pass
+
     run(["systemctl", "daemon-reload"], check=True)
-    if cfg["enabled"]:
-        run(["systemctl", "enable", "--now", "nas-auto-snapshot.timer"], check=True)
-    else:
-        run(["systemctl", "disable", "--now", "nas-auto-snapshot.timer"], check=False)
+    for svc_name, spec in wanted.items():
+        timer = Path(svc_name).with_suffix(".timer").name
+        run(["systemctl", "enable", "--now", timer], check=True)
 
 
-def auto_snapshot_timer_state() -> str:
-    if not AUTO_SNAP_TIMER.exists():
-        return "未安装"
-    return _service_state("nas-auto-snapshot.timer")
+def auto_snapshot_timer_summary(cfg: dict) -> str:
+    groups = auto_snapshot_schedule_groups(cfg)
+    if not groups:
+        return "无计划"
+    total = len(groups)
+    active = 0
+    for spec in groups:
+        _, tmr = _snap_unit_paths(spec)
+        if _service_state(tmr.name) == "active":
+            active += 1
+    return f"{active}/{total} 个定时器运行"
+
+
+def _auto_snapshot_pick_schedule(current: str) -> str | None:
+    """交互式选择计划，返回 OnCalendar 表达式；取消返回 None。"""
+    preset = select_one("快照计划", [
+        ("每小时整点", "hourly"),
+        ("每 6 小时（00/06/12/18 点）", "six"),
+        ("每天指定时间", "daily"),
+        ("每周指定时间", "weekly"),
+        (f"保持不变（当前 {auto_snapshot_schedule_text(current)}）", "keep"),
+        ("返回", "back"),
+    ])
+    if preset in (None, "back"):
+        return None
+    if preset == "keep":
+        return current
+    if preset == "hourly":
+        return "*-*-* *:00:00"
+    if preset == "six":
+        return "*-*-* 00,06,12,18:00:00"
+    day = ""
+    if preset == "weekly":
+        day = select_one("星期", [
+            ("周一", "Mon"), ("周二", "Tue"), ("周三", "Wed"),
+            ("周四", "Thu"), ("周五", "Fri"), ("周六", "Sat"),
+            ("周日", "Sun"), ("返回", "back"),
+        ])
+        if day in (None, "back"):
+            return None
+    value = ask_text("时间（HH:MM）", "03:00")
+    clock = _auto_snap_time(value)
+    if not clock:
+        print("时间格式不正确，应为 HH:MM。")
+        pause()
+        return None
+    return f"{day} *-*-* {clock}:00" if day else f"*-*-* {clock}:00"
+
+
+def ui_auto_snapshot_schedules(cfg: dict) -> None:
+    if not cfg.get("datasets"):
+        print("请先选择要自动快照的数据集。")
+        pause()
+        return
+    while True:
+        options = [
+            (f"{row['name']}    {auto_snapshot_schedule_text(row['oncalendar'])}",
+             row["name"])
+            for row in cfg["datasets"]
+        ]
+        options.append(("返回", "back"))
+        choice = select_one("设置各数据集计划", options)
+        if choice in (None, "back"):
+            return
+        row = next((r for r in cfg["datasets"] if r["name"] == choice), None)
+        if row is None:
+            continue
+        spec = _auto_snapshot_pick_schedule(row["oncalendar"])
+        if spec is None or spec == row["oncalendar"]:
+            continue
+        row["oncalendar"] = spec
+        save_auto_snapshot(cfg)
+        if cfg["enabled"]:
+            sync_auto_snapshot_timers(cfg)
+        print(f"{row['name']} 计划已改为 {auto_snapshot_schedule_text(spec)}")
+        pause()
 
 
 def ui_auto_snapshot_menu() -> None:
@@ -2749,18 +2911,25 @@ def ui_auto_snapshot_menu() -> None:
         return
     while True:
         cfg = load_auto_snapshot()
+        groups = auto_snapshot_schedule_groups(cfg)
+        schedule_txt = ("、".join(sorted({auto_snapshot_schedule_text(s)
+                                          for s in groups})) or "未设置")
+        dataset_txt = "、".join(
+            f"{row['name']}（{auto_snapshot_schedule_text(row['oncalendar'])}）"
+            for row in cfg["datasets"]) or "(未选择)"
         info = [
-            f"状态    {'已开启' if cfg['enabled'] else '已关闭'}（定时器 {auto_snapshot_timer_state()}）",
-            f"计划    {auto_snapshot_schedule_text(cfg['oncalendar'])}",
+            f"状态    {'已开启' if cfg['enabled'] else '已关闭'}"
+            f"（{auto_snapshot_timer_summary(cfg)}）",
+            f"计划    {schedule_txt}",
             f"保留    {cfg['keep'] or '不清理'} 份自动快照",
-            f"数据集  {'、'.join(cfg['datasets']) or '(未选择)'}",
+            f"数据集  {dataset_txt}",
             f"上次    {cfg['last_run'] or '无'}  {cfg['last_result']}",
         ]
         if cfg.get("pending"):
             info.append(f"待补    {len(cfg['pending'])} 个（硬盘休眠中，唤醒后自动补做）")
         choice = select_one("自动快照", [
             ("关闭自动快照" if cfg["enabled"] else "开启自动快照", "toggle"),
-            ("设置计划", "schedule"),
+            ("设置各数据集计划", "schedule"),
             ("选择数据集", "datasets"),
             ("设置保留份数", "keep"),
             ("立即执行一次", "now"),
@@ -2778,49 +2947,12 @@ def ui_auto_snapshot_menu() -> None:
                     continue
             cfg["enabled"] = not cfg["enabled"]
             save_auto_snapshot(cfg)
-            install_auto_snapshot_units(cfg)
+            sync_auto_snapshot_timers(cfg)
             print("已开启自动快照" if cfg["enabled"] else "已关闭自动快照")
             pause()
 
         elif choice == "schedule":
-            preset = select_one("快照计划", [
-                ("每小时整点", "hourly"),
-                ("每 6 小时（00/06/12/18 点）", "six"),
-                ("每天指定时间", "daily"),
-                ("每周指定时间", "weekly"),
-                ("返回", "back"),
-            ])
-            if preset in (None, "back"):
-                continue
-            if preset == "hourly":
-                cfg["oncalendar"] = "*-*-* *:00:00"
-            elif preset == "six":
-                cfg["oncalendar"] = "*-*-* 00,06,12,18:00:00"
-            else:
-                day = ""
-                if preset == "weekly":
-                    day = select_one("星期", [
-                        ("周一", "Mon"), ("周二", "Tue"), ("周三", "Wed"),
-                        ("周四", "Thu"), ("周五", "Fri"), ("周六", "Sat"),
-                        ("周日", "Sun"), ("返回", "back"),
-                    ])
-                    if day in (None, "back"):
-                        continue
-                value = ask_text("时间（HH:MM）", "03:00")
-                clock = _auto_snap_time(value)
-                if not clock:
-                    print("时间格式不正确，应为 HH:MM。")
-                    pause()
-                    continue
-                if day:
-                    cfg["oncalendar"] = f"{day} *-*-* {clock}:00"
-                else:
-                    cfg["oncalendar"] = f"*-*-* {clock}:00"
-            save_auto_snapshot(cfg)
-            if AUTO_SNAP_TIMER.exists():
-                install_auto_snapshot_units(cfg)
-            print(f"计划已改为 {auto_snapshot_schedule_text(cfg['oncalendar'])}")
-            pause()
+            ui_auto_snapshot_schedules(cfg)
 
         elif choice == "datasets":
             rows = [row for row in zfs_datasets() if row["type"] == "filesystem"]
@@ -2828,17 +2960,27 @@ def ui_auto_snapshot_menu() -> None:
                 print("没有可用的文件系统数据集。")
                 pause()
                 continue
+            current = {row["name"] for row in cfg["datasets"]}
             picked = select_multi(
                 "选择要自动快照的数据集",
                 [(row["name"], row["name"]) for row in rows],
-                initial=[name for name in cfg["datasets"]
+                initial=[name for name in auto_snapshot_dataset_names(cfg)
                          if name in {row["name"] for row in rows}],
-                info=["只对选中的数据集创建快照，子数据集不自动包含"],
+                info=["新加入的数据集使用默认计划，可在「设置各数据集计划」里单独调整"],
             )
             if picked is None:
                 continue
-            cfg["datasets"] = list(picked)
+            by_name = {row["name"]: row for row in cfg["datasets"]}
+            cfg["datasets"] = [
+                by_name.get(name, {"name": name,
+                                   "oncalendar": cfg["oncalendar"]})
+                for name in picked
+            ]
+            for row in cfg["datasets"]:
+                row.setdefault("oncalendar", cfg["oncalendar"])
             save_auto_snapshot(cfg)
+            if cfg["enabled"]:
+                sync_auto_snapshot_timers(cfg)
             print(f"已选择 {len(picked)} 个数据集")
             pause()
 
@@ -6507,11 +6649,12 @@ def system_status_lines() -> list[str]:
             f"{_unit_state('nas-hdd-monitor.service', 'is-active')}"
         )
 
-    if AUTO_SNAP_TIMER.exists():
+    auto_cfg = load_auto_snapshot()
+    if auto_cfg["datasets"]:
         lines.append(
             "自动快照  "
-            f"{_unit_state('nas-auto-snapshot.timer', 'is-enabled')} · "
-            f"{_unit_state('nas-auto-snapshot.timer', 'is-active')}"
+            f"{'已开启' if auto_cfg['enabled'] else '已关闭'} · "
+            f"{auto_snapshot_timer_summary(auto_cfg)}"
         )
 
     if unit_exists("zfs-load-key.service"):
@@ -6816,7 +6959,7 @@ def main_info_lines() -> list[str]:
         auto = load_auto_snapshot()
         if auto["enabled"]:
             lines.append(
-                f"快照   自动快照 {auto_snapshot_schedule_text(auto['oncalendar'])}"
+                f"快照   自动快照 {len(auto_snapshot_schedule_groups(auto))} 种计划"
                 f" · 保留 {auto['keep'] or '不限'} 份 · {len(auto['datasets'])} 个数据集"
                 + (f" · 待补 {len(auto['pending'])}" if auto.get("pending") else "")
             )
@@ -6883,7 +7026,8 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         self_install()
     if AUTO_SNAPSHOT:
-        return auto_snapshot_run()
+        return auto_snapshot_run(
+            schedule=(os.environ.get("NAS_AUTO_SNAPSHOT_SCHEDULE") or "").strip() or None)
     if HDD_SLEEP:
         apply_hdd_sleep_settings()
     if HDD_MONITOR:
